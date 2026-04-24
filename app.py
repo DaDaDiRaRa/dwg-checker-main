@@ -775,7 +775,7 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         logger.addHandler(gui_handler)
 
         logger.info("=" * 72)
-        logger.info(" AutoDWG 검토 자동화 시스템  v6.7")
+        logger.info(" AutoDWG 검토 자동화 시스템  v6.7 _ © 2026. 김정현. All rights reserved.")
         logger.info("=" * 72)
         logger.info(" 환영합니다! 파일이나 폴더를 '드래그 앤 드롭' 하거나 버튼으로 추가하세요.\n")
 
@@ -807,7 +807,7 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         inn.pack(fill="both", expand=True, padx=22)
         ctk.CTkLabel(inn, text="AutoDWG  검토 자동화 시스템",
                      font=F_H1, text_color="white", anchor="w").pack(side="left", fill="y")
-        ctk.CTkLabel(inn, text="v 6.7", font=F_SM,
+        ctk.CTkLabel(inn, text="v 6.7 _ © 2026. 김정현. All rights reserved.", font=F_SM,
                      text_color="#a8c8ff", anchor="e").pack(side="right")
 
         page = ctk.CTkScrollableFrame(self, fg_color=BG,
