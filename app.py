@@ -254,17 +254,35 @@ def _extract_drawing_number(text: str) -> Optional[str]:
 def _정리문자열(txt: str) -> str:
     return re.sub(r"\s+", " ", (txt or "")).strip()
 
+def _expand_title_keywords(title: str) -> set:
+    """도면명에서 키워드 집합을 추출. 쉼표 축약형을 확장한다.
+    예) '입,단면도' → {'입면도','단면도'} / '지상1층,지상2층' → {'지상1층','지상2층'}"""
+    result = set()
+    for word in title.strip().split():
+        if ',' not in word:
+            if word:
+                result.add(word)
+            continue
+        parts = word.split(',')
+        last = parts[-1]
+        for part in parts[:-1]:
+            # 앞 조각이 마지막 조각보다 짧으면 마지막의 뒷부분(접미사)을 붙여 완성
+            result.add(part + last[len(part):] if len(part) < len(last) else part)
+        result.add(last)
+    return {w for w in result if w}
+
 def _title_contains_view(block_title: str, view_title: str) -> bool:
-    """뷰 심볼 도면명의 단어들이 도곽 도면명 안에 모두 포함되는지 확인."""
+    """뷰 심볼 도면명의 단어들이 도곽 도면명 안에 모두 포함되는지 확인.
+    뷰 도면명 끝의 번호 접미사(예: '-1', '-2')는 비교 전에 제거한다."""
     if not view_title or not block_title:
         return False
     for bad in ('nan', 'x', 'none', ''):
         if view_title.lower().strip() == bad or block_title.lower().strip() == bad:
             return False
-    norm_block = re.sub(r'[,，、·\s]+', ' ', block_title.strip())
-    norm_view  = re.sub(r'[,，、·\s]+', ' ', view_title.strip())
-    block_words = {w for w in norm_block.split() if w}
-    view_words  = {w for w in norm_view.split()  if w}
+    # 뷰 도면명 끝 번호 제거: "입면도-1" → "입면도", "단면도 2" → "단면도"
+    view_stripped = re.sub(r'[\s\-_]+\d+\s*$', '', view_title.strip())
+    block_words = _expand_title_keywords(block_title)
+    view_words  = _expand_title_keywords(view_stripped)
     return bool(view_words) and view_words.issubset(block_words)
 
 def _cad_로드(path: Path):
@@ -344,7 +362,12 @@ def _parse_xref_original(xref_path: str) -> List[Tuple[float, float, str, float]
 
 def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: float,
                            base_w: float, base_h: float, view_roi: list, rot_deg: float) -> List[dict]:
-    """view_symbol_roi 안의 원+선 제목 기호에서 뷰 도면명과 축척을 추출."""
+    """view_symbol_roi 안의 원+선 제목 기호에서 뷰 도면명과 축척을 추출.
+
+    양식: 원의 중심을 수평 LINE이 관통하며 오른쪽으로 뻗고,
+          선 위 = 도면명(한글 포함), 선 아래 = 축척(S:A3=1/200 형식).
+    수평 LINE이 원을 통과하지 않는 원은 장식용으로 간주하여 무시한다.
+    """
     rad = math.radians(-rot_deg)
     cos_v, sin_v = math.cos(rad), math.sin(rad)
 
@@ -352,24 +375,79 @@ def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: f
         dx, dy = tx - ix, ty - iy
         return ix + dx * cos_v - dy * sin_v, iy + dx * sin_v + dy * cos_v
 
+    def _pt_seg_dist(px, py, sx, sy, ex, ey):
+        """점 (px,py)에서 선분까지의 최단 거리."""
+        dx, dy = ex - sx, ey - sy
+        len_sq = dx * dx + dy * dy
+        if len_sq == 0:
+            return math.hypot(px - sx, py - sy)
+        t = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / len_sq))
+        return math.hypot(px - (sx + t * dx), py - (sy + t * dy))
+
     x_min = ix + base_w * xscale * view_roi[0]
     x_max = ix + base_w * xscale * view_roi[1]
     y_min = iy + base_h * yscale * view_roi[2]
     y_max = iy + base_h * yscale * view_roi[3]
 
-    # INSERT 블록 내부 텍스트(도면번호, 치수 등)가 섞이지 않도록
-    # 모델스페이스 직접 TEXT/MTEXT 엔티티만 사용한다.
+    def _in_roi(tx, ty):
+        return x_min <= float(tx) <= x_max and y_min <= float(ty) <= y_max
+
+    # view_symbol_roi 박스 안의 TEXT/MTEXT만 수집
+    # (박스 밖 도곽 텍스트가 섞이지 않도록 ROI 경계를 엄격히 적용)
     all_texts = []
     for ent in layout.query("TEXT MTEXT"):
         try:
-            if ent.dxftype() == "TEXT":
-                tx, ty = float(ent.dxf.insert.x), float(ent.dxf.insert.y)
-                txt = _정리문자열(ent.dxf.text)
-            else:
-                tx, ty = float(ent.dxf.insert.x), float(ent.dxf.insert.y)
-                txt = _정리문자열(ent.plain_text())
-            if txt:
-                all_texts.append((tx, ty, txt, 0.0))
+            tx2, ty2 = float(ent.dxf.insert.x), float(ent.dxf.insert.y)
+            if not _in_roi(tx2, ty2):
+                continue
+            txt2 = _정리문자열(ent.dxf.text if ent.dxftype() == "TEXT" else ent.plain_text())
+            if txt2:
+                all_texts.append((tx2, ty2, txt2))
+        except Exception:
+            pass
+
+    # INSERT 블록 내부 TEXT/MTEXT도 수집 (뷰심볼이 블록으로 정의된 경우)
+    # 변환 후 좌표가 ROI 안에 있는 것만 추가
+    try:
+        doc = layout.doc
+        for ins in layout.query("INSERT"):
+            try:
+                ip = ins.dxf.insert
+                ipx, ipy = float(ip.x), float(ip.y)
+                ixs = float(ins.dxf.get('xscale', 1.0) or 1.0)
+                iys = float(ins.dxf.get('yscale', 1.0) or 1.0)
+                ir  = math.radians(float(ins.dxf.get('rotation', 0.0) or 0.0))
+                ic, is_ = math.cos(ir), math.sin(ir)
+                blk = doc.blocks.get(ins.dxf.name)
+                if blk is None:
+                    continue
+                for sub in blk:
+                    if sub.dxftype() not in ("TEXT", "MTEXT"):
+                        continue
+                    try:
+                        lx = float(sub.dxf.insert.x) * ixs
+                        ly = float(sub.dxf.insert.y) * iys
+                        wx = ipx + lx * ic - ly * is_
+                        wy = ipy + lx * is_ + ly * ic
+                        if not _in_roi(wx, wy):
+                            continue
+                        stxt = _정리문자열(sub.dxf.text if sub.dxftype() == "TEXT" else sub.plain_text())
+                        if stxt:
+                            all_texts.append((wx, wy, stxt))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # LINE 엔티티 수집
+    all_lines = []
+    for ent in layout.query("LINE"):
+        try:
+            sx, sy = float(ent.dxf.start.x), float(ent.dxf.start.y)
+            ex, ey = float(ent.dxf.end.x), float(ent.dxf.end.y)
+            all_lines.append((sx, sy, ex, ey))
         except Exception:
             pass
 
@@ -390,31 +468,65 @@ def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: f
             continue
         seen.add(key)
 
-        nearby = sorted(
-            [(math.sqrt((tx - cx) ** 2 + (ty - cy) ** 2), txt)
-             for tx, ty, txt, _ in all_texts
-             if math.sqrt((tx - cx) ** 2 + (ty - cy) ** 2) < r * 15],
-            key=lambda t: t[0]
-        )
+        # 수평 LINE 탐색: 원 중심을 관통하며 오른쪽으로 '비대칭으로' 뻗은 선
+        # 뷰심볼: 왼쪽 연장 ≤ r 정도, 오른쪽 연장은 훨씬 길다
+        # 구조 십자선: 좌우 대칭 → 비율 검사로 제외
+        far_right_x = None
+        for sx, sy, ex, ey in all_lines:
+            dx_l, dy_l = ex - sx, ey - sy
+            length = math.hypot(dx_l, dy_l)
+            if length < r * 0.3:
+                continue
+            if abs(dy_l / length) > math.sin(math.radians(30)):
+                continue
+            if _pt_seg_dist(cx, cy, sx, sy, ex, ey) > r * 1.5:
+                continue
+            right_x = max(sx, ex)
+            left_x  = min(sx, ex)
+            right_ext = right_x - cx           # 오른쪽 연장 거리
+            left_ext  = max(0.0, cx - left_x)  # 왼쪽 연장 거리
+            # 오른쪽으로 최소 2r 이상 뻗어야 함
+            if right_ext < r * 2:
+                continue
+            # 뷰심볼 선은 왼쪽보다 오른쪽이 2배 이상 길어야 함 (구조 십자선 제외)
+            if left_ext > 0 and right_ext < left_ext * 2:
+                continue
+            if far_right_x is None or right_x > far_right_x:
+                far_right_x = right_x
 
-        title_text = scale_type = scale_val = ""
-        for d, txt in nearby:
-            if d < r * 1.2:
+        if far_right_x is None:
+            continue  # 뷰심볼 형태의 선 없음 → 건너뜀
+
+        # 수평선이 원 중심을 통과하므로 line_y = cy
+        line_y = cy
+
+        # 도면명: view_roi 박스 안, line_y 위쪽, 한글 포함 → 가장 가까운 것
+        # (all_texts는 이미 ROI 안으로 필터링돼 있으므로 별도 x/y 마진 불필요)
+        title_cands = []
+        for _, ty, txt in all_texts:
+            if ty <= line_y:
+                continue
+            if not re.search(r'[가-힣]', txt) or len(txt.replace(' ', '')) < 3:
+                continue
+            title_cands.append((ty - line_y, txt))
+        title_text = _정리문자열(min(title_cands, key=lambda t: t[0])[1]) if title_cands else ""
+
+        # 축척: view_roi 박스 안, line_y 아래쪽, 패턴 매칭 → 가장 가까운 것
+        scale_type = scale_val = ""
+        scale_cands = []
+        for _, ty, txt in all_texts:
+            if ty >= line_y:
                 continue
             m = _뷰_축척_타입_패턴.search(txt)
-            if m and not scale_val:
-                scale_type = m.group(1).upper()
-                scale_val = _축척_텍스트_정리(m.group(2))
-                continue
-            clean = txt.replace(' ', '')
-            if len(clean) <= 2 or re.match(r'^[A-Z0-9]{1,4}$', clean.upper()):
-                continue
-            # 뷰 심볼 도면명은 반드시 한글을 포함한다 (도면번호·참조기호 제외)
-            if not title_text and len(txt) >= 3 and re.search(r'[가-힣]', txt):
-                title_text = _정리문자열(txt)
+            if m:
+                scale_cands.append((line_y - ty, m.group(1).upper(), _축척_텍스트_정리(m.group(2))))
+        if scale_cands:
+            _, scale_type, scale_val = min(scale_cands, key=lambda t: t[0])
 
-        if title_text:
-            symbols.append({'뷰_도면명': title_text, '뷰_축척_종류': scale_type, '뷰_축척': scale_val})
+        # 도면명과 축척 둘 다 있어야 유효한 뷰심볼 (하나만 있으면 오탐으로 간주)
+        if title_text and scale_val:
+            symbols.append({'뷰_도면명': title_text, '뷰_축척_종류': scale_type, '뷰_축척': scale_val,
+                            '_cx': round(cx, 1), '_cy': round(cy, 1)})
 
     return symbols
 
@@ -486,7 +598,7 @@ def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], head
             else: pairings.append((d_a3, sval, 'A3'))
             
     pairings.sort(key=lambda p: p[0])
-    for d, sval, target in pairings:
+    for _, sval, target in pairings:
         if target == 'A1' and a1_val == "X": a1_val = sval
         elif target == 'A3' and a3_val == "X": a3_val = sval
         
@@ -527,7 +639,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                 if xref_texts: 모든텍스트.extend(_transform_xref_texts(xref_texts, ix, iy, xscale, yscale, rot_deg))
 
                 target_ranges = list_rois if list_rois else [[0.0, 1.0, 0.0, 1.0]]
-                for roi_idx, roi in enumerate(target_ranges):
+                for roi in target_ranges:
                     min_x, max_x = ix + (너비 * roi[0]), ix + (너비 * roi[1])
                     y_min, y_max = iy + (높이 * roi[2]), iy + (높이 * roi[3]); roi_w = max_x - min_x
                     num_x_cands, title_x_cands, remark_x_cands, a1_matches, a3_matches, 구역_텍스트 = [], [], [], [], [], []
@@ -659,7 +771,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
     전체경로, 목표블록, roi_cfg, base_w, base_h, xref_texts = args
     파일명, 데이터, 뷰심볼, 에러메시지 = os.path.basename(전체경로), [], [], ""
     view_roi = roi_cfg.get('view_symbol_roi')
-    view_extracted = False
+    seen_circles: set = set()  # 파일 전체 기준 원 중복 방지
     try:
         doc = _cad_로드(Path(전체경로)); 도곽_발견됨 = False
         for layout in doc.layouts:
@@ -729,10 +841,16 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                 명칭 = _clean_title_only(명칭); a1, a3 = _extract_scale_smart(s_texts, is_list_table=False)
                 if 번호:
                     데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "구분_DWG(동)": dwg_dong, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
-                    # 뷰 심볼은 레이아웃당 최초 1회만 추출
-                    if view_roi and not view_extracted:
-                        view_extracted = True
+                    # 도곽마다 해당 위치 기준의 ROI에서 뷰 심볼 추출
+                    # seen_circles로 ROI 중복 시 같은 원이 두 번 들어가는 것을 방지
+                    if view_roi:
                         for sym in _extract_view_symbols(layout, ix, iy, xscale, yscale, base_w, base_h, view_roi, rot_deg):
+                            # 같은 물리적 원이 여러 도곽 ROI에서 중복 검출되는 것만 방지
+                            pos_key = (sym['_cx'], sym['_cy'])
+                            if pos_key in seen_circles:
+                                continue
+                            seen_circles.add(pos_key)
+                            sym.pop('_cx'); sym.pop('_cy')
                             sym.update({"파일명": 파일명, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
                             뷰심볼.append(sym)
         del doc
@@ -803,13 +921,22 @@ def _build_view_sheet(ws, view_df: pd.DataFrame):
     df["축척_일치"]  = df.apply(_chk_scale, axis=1)
     df["상태"] = df.apply(lambda r: "일치" if r["도면명_포함"] == "O" and r["축척_일치"] == "O" else "불일치", axis=1)
 
+    # 같은 파일 내에서 뷰 도면명이 중복이면 오타 가능성 → "중복" 상태로 덮어쓰기
+    dup_mask = df.duplicated(subset=["파일명", "뷰_도면명"], keep=False)
+    df.loc[dup_mask, "상태"] = "중복"
+
     col_keys = list(cols.keys())
+    주황색 = PatternFill(start_color="FFFFD699", end_color="FFFFD699", fill_type="solid")
     for j, (key, label) in enumerate(cols.items(), 1):
         c = ws.cell(1, j, label); c.fill = 헤더색
     for i, row in enumerate(df[col_keys].fillna("").itertuples(index=False), 2):
         for j, val in enumerate(row, 1):
             ws.cell(i, j, str(val))
-        if ws.cell(i, col_keys.index("상태") + 1).value != "일치":
+        status = ws.cell(i, col_keys.index("상태") + 1).value
+        if status == "중복":
+            for j in range(1, len(col_keys) + 1):
+                ws.cell(i, j).fill = 주황색
+        elif status != "일치":
             for j in range(1, len(col_keys) + 1):
                 ws.cell(i, j).fill = 빨간색
 
