@@ -528,6 +528,82 @@ def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: f
             symbols.append({'뷰_도면명': title_text, '뷰_축척_종류': scale_type, '뷰_축척': scale_val,
                             '_cx': round(cx, 1), '_cy': round(cy, 1)})
 
+    # ── ATTRIB 기반 뷰심볼 처리 ──────────────────────────────────────────────
+    # 뷰심볼이 INSERT 블록으로 정의되고 도면명/축척이 ATTRIB로 저장된 경우
+    # (TEXT/MTEXT 대신 고급속성편집기에서 수정하는 블록)
+    try:
+        _doc = layout.doc
+        for ins in layout.query("INSERT"):
+            try:
+                attrib_list = list(ins.attribs)
+                if not attrib_list:
+                    continue
+
+                ipx = float(ins.dxf.insert.x)
+                ipy = float(ins.dxf.insert.y)
+                uipx, uipy = _unrot(ipx, ipy)
+                if not (x_min <= uipx <= x_max and y_min <= uipy <= y_max):
+                    continue
+
+                # 블록 정의에 CIRCLE이 있어야 뷰심볼로 간주
+                _blk = _doc.blocks.get(ins.dxf.name)
+                if _blk is None:
+                    continue
+
+                ixs2 = float(ins.dxf.get('xscale', 1.0) or 1.0)
+                iys2 = float(ins.dxf.get('yscale', 1.0) or 1.0)
+                ir2  = math.radians(float(ins.dxf.get('rotation', 0.0) or 0.0))
+                ic2, is2 = math.cos(ir2), math.sin(ir2)
+
+                # 블록 정의에서 CIRCLE 좌표 찾기 (WCS 변환)
+                circle_wcy = None
+                for sub in _blk:
+                    if sub.dxftype() == "CIRCLE":
+                        lx2 = float(sub.dxf.center.x) * ixs2
+                        ly2 = float(sub.dxf.center.y) * iys2
+                        circle_wcy = ipy + lx2 * is2 + ly2 * ic2
+                        break
+                if circle_wcy is None:
+                    continue  # CIRCLE 없으면 뷰심볼 블록이 아님
+
+                line_y2 = circle_wcy
+                key = (round(ipx, 1), round(ipy, 1))
+                if key in seen:
+                    continue
+
+                # ATTRIB에서 도면명(위)/축척(아래) 추출
+                # ATTRIB 삽입점은 WCS 기준으로 저장됨
+                title_cands2, scale_cands2 = [], []
+                for attrib in attrib_list:
+                    try:
+                        aty = float(attrib.dxf.insert.y)
+                        atxt = _정리문자열(attrib.dxf.text)
+                        if not atxt:
+                            continue
+                        if aty > line_y2:
+                            if re.search(r'[가-힣]', atxt) and len(atxt.replace(' ', '')) >= 3:
+                                title_cands2.append((aty - line_y2, atxt))
+                        else:
+                            m = _뷰_축척_타입_패턴.search(atxt)
+                            if m:
+                                scale_cands2.append((line_y2 - aty, m.group(1).upper(), _축척_텍스트_정리(m.group(2))))
+                    except Exception:
+                        pass
+
+                title_text2 = _정리문자열(min(title_cands2, key=lambda t: t[0])[1]) if title_cands2 else ""
+                scale_type2 = scale_val2 = ""
+                if scale_cands2:
+                    _, scale_type2, scale_val2 = min(scale_cands2, key=lambda t: t[0])
+
+                if title_text2 and scale_val2:
+                    seen.add(key)
+                    symbols.append({'뷰_도면명': title_text2, '뷰_축척_종류': scale_type2, '뷰_축척': scale_val2,
+                                    '_cx': round(ipx, 1), '_cy': round(ipy, 1)})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return symbols
 
 def _transform_xref_texts(xref_texts: List[Tuple[float, float, str, float]], ix: float, iy: float, xscale: float, yscale: float, rot_deg: float) -> List[Tuple[float, float, str, float]]:
