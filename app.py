@@ -97,6 +97,7 @@ def _oda_환경_설정() -> str:
 # ============================================================================
 _도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[\s\-_~–—−]+\d{1,5}(?![가-힣㎡,]))*[A-Za-z]*|TOE)(?!\d|[A-Za-z]|[가-힣])")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?([\d,]+)|NONE|N/A)", re.I)
+_뷰_축척_타입_패턴 = re.compile(r'\b(A[13])\s*[=:]\s*(1\s*/\s*[\d,]+)', re.I)
 _동_패턴 = re.compile(r"((?:[0-9A-Za-z]+\s*[,~&]\s*)*[0-9A-Za-z]+동)")
 _동_제외단어 = ["인동", "주동", "공동", "자동", "수동", "전동", "연동", "이동", "작동", "부동", "진동", "명동", "구동", "개동", "각동", "해당동", "상동", "하동"]
 
@@ -253,6 +254,19 @@ def _extract_drawing_number(text: str) -> Optional[str]:
 def _정리문자열(txt: str) -> str:
     return re.sub(r"\s+", " ", (txt or "")).strip()
 
+def _title_contains_view(block_title: str, view_title: str) -> bool:
+    """뷰 심볼 도면명의 단어들이 도곽 도면명 안에 모두 포함되는지 확인."""
+    if not view_title or not block_title:
+        return False
+    for bad in ('nan', 'x', 'none', ''):
+        if view_title.lower().strip() == bad or block_title.lower().strip() == bad:
+            return False
+    norm_block = re.sub(r'[,，、·\s]+', ' ', block_title.strip())
+    norm_view  = re.sub(r'[,，、·\s]+', ' ', view_title.strip())
+    block_words = {w for w in norm_block.split() if w}
+    view_words  = {w for w in norm_view.split()  if w}
+    return bool(view_words) and view_words.issubset(block_words)
+
 def _cad_로드(path: Path):
     if path.suffix.lower() == ".dxf": return ezdxf.readfile(str(path))
     _oda_환경_설정()
@@ -327,6 +341,82 @@ def _parse_xref_original(xref_path: str) -> List[Tuple[float, float, str, float]
         logger.info("  -> 엑스레이 스캔 성공! %d개의 고정 텍스트 암기 완료.", len(out))
         return out
     except Exception as e: logger.error("XREF 스캔 실패: %s", e); return []
+
+def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: float,
+                           base_w: float, base_h: float, view_roi: list, rot_deg: float) -> List[dict]:
+    """view_symbol_roi 안의 원+선 제목 기호에서 뷰 도면명과 축척을 추출."""
+    rad = math.radians(-rot_deg)
+    cos_v, sin_v = math.cos(rad), math.sin(rad)
+
+    def _unrot(tx, ty):
+        dx, dy = tx - ix, ty - iy
+        return ix + dx * cos_v - dy * sin_v, iy + dx * sin_v + dy * cos_v
+
+    x_min = ix + base_w * xscale * view_roi[0]
+    x_max = ix + base_w * xscale * view_roi[1]
+    y_min = iy + base_h * yscale * view_roi[2]
+    y_max = iy + base_h * yscale * view_roi[3]
+
+    # INSERT 블록 내부 텍스트(도면번호, 치수 등)가 섞이지 않도록
+    # 모델스페이스 직접 TEXT/MTEXT 엔티티만 사용한다.
+    all_texts = []
+    for ent in layout.query("TEXT MTEXT"):
+        try:
+            if ent.dxftype() == "TEXT":
+                tx, ty = float(ent.dxf.insert.x), float(ent.dxf.insert.y)
+                txt = _정리문자열(ent.dxf.text)
+            else:
+                tx, ty = float(ent.dxf.insert.x), float(ent.dxf.insert.y)
+                txt = _정리문자열(ent.plain_text())
+            if txt:
+                all_texts.append((tx, ty, txt, 0.0))
+        except Exception:
+            pass
+
+    symbols, seen = [], set()
+    for ent in layout.query("CIRCLE"):
+        try:
+            cx, cy = float(ent.dxf.center.x), float(ent.dxf.center.y)
+            r = float(ent.dxf.radius)
+        except Exception:
+            continue
+        if r <= 0:
+            continue
+        ucx, ucy = _unrot(cx, cy)
+        if not (x_min <= ucx <= x_max and y_min <= ucy <= y_max):
+            continue
+        key = (round(cx, 1), round(cy, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        nearby = sorted(
+            [(math.sqrt((tx - cx) ** 2 + (ty - cy) ** 2), txt)
+             for tx, ty, txt, _ in all_texts
+             if math.sqrt((tx - cx) ** 2 + (ty - cy) ** 2) < r * 15],
+            key=lambda t: t[0]
+        )
+
+        title_text = scale_type = scale_val = ""
+        for d, txt in nearby:
+            if d < r * 1.2:
+                continue
+            m = _뷰_축척_타입_패턴.search(txt)
+            if m and not scale_val:
+                scale_type = m.group(1).upper()
+                scale_val = _축척_텍스트_정리(m.group(2))
+                continue
+            clean = txt.replace(' ', '')
+            if len(clean) <= 2 or re.match(r'^[A-Z0-9]{1,4}$', clean.upper()):
+                continue
+            # 뷰 심볼 도면명은 반드시 한글을 포함한다 (도면번호·참조기호 제외)
+            if not title_text and len(txt) >= 3 and re.search(r'[가-힣]', txt):
+                title_text = _정리문자열(txt)
+
+        if title_text:
+            symbols.append({'뷰_도면명': title_text, '뷰_축척_종류': scale_type, '뷰_축척': scale_val})
+
+    return symbols
 
 def _transform_xref_texts(xref_texts: List[Tuple[float, float, str, float]], ix: float, iy: float, xscale: float, yscale: float, rot_deg: float) -> List[Tuple[float, float, str, float]]:
     transformed = []; rad = math.radians(rot_deg); cos_val = math.cos(rad); sin_val = math.sin(rad)
@@ -565,9 +655,11 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
     df = pd.DataFrame(데이터)
     return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(동)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"]) if df.empty else df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
 
-def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[float, float, str, float]]]) -> Tuple[List[dict], str]:
+def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[float, float, str, float]]]) -> Tuple[List[dict], List[dict], str]:
     전체경로, 목표블록, roi_cfg, base_w, base_h, xref_texts = args
-    파일명, 데이터, 에러메시지 = os.path.basename(전체경로), [], ""
+    파일명, 데이터, 뷰심볼, 에러메시지 = os.path.basename(전체경로), [], [], ""
+    view_roi = roi_cfg.get('view_symbol_roi')
+    view_extracted = False
     try:
         doc = _cad_로드(Path(전체경로)); 도곽_발견됨 = False
         for layout in doc.layouts:
@@ -635,37 +727,93 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                     if 임시_명칭: 명칭 = 임시_명칭
                     
                 명칭 = _clean_title_only(명칭); a1, a3 = _extract_scale_smart(s_texts, is_list_table=False)
-                if 번호: 데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "구분_DWG(동)": dwg_dong, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
+                if 번호:
+                    데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "구분_DWG(동)": dwg_dong, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
+                    # 뷰 심볼은 레이아웃당 최초 1회만 추출
+                    if view_roi and not view_extracted:
+                        view_extracted = True
+                        for sym in _extract_view_symbols(layout, ix, iy, xscale, yscale, base_w, base_h, view_roi, rot_deg):
+                            sym.update({"파일명": 파일명, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
+                            뷰심볼.append(sym)
         del doc
-        if not 도곽_발견됨: return 데이터, "도곽 블록 없음"
+        if not 도곽_발견됨: return 데이터, 뷰심볼, "도곽 블록 없음"
     except Exception as e: 에러메시지 = str(e)
-    return 데이터, 에러메시지
+    return 데이터, 뷰심볼, 에러메시지
 
-def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> pd.DataFrame:
+def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     모든_캐드파일 = []
     for d in target_dirs:
         폴더 = Path(d)
         if 폴더.exists(): 모든_캐드파일.extend([str(p) for p in 폴더.iterdir() if p.is_file() and p.suffix.lower() in [".dwg", ".dxf"]])
     캐드파일들 = sorted(list(set(모든_캐드파일)))
+    _빈_dwg = pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
+    _빈_뷰 = pd.DataFrame(columns=["파일명", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "뷰_도면명", "뷰_축척_종류", "뷰_축척"])
     if not 캐드파일들:
-        logger.warning("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
+        logger.warning("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return _빈_dwg, _빈_뷰
 
     logger.info("[CAD ] 총 %d개의 개별 도면 분석 중... (터보 모드 가동 🚀)", len(캐드파일들))
-    최종_데이터 = []
+    최종_데이터, 최종_뷰심볼 = [], []
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {executor.submit(_process_single_dwg, (path, slave_block_name.strip().lower(), roi_cfg, base_w, base_h, xref_texts)): path for path in 캐드파일들}
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             경로 = futures[future]
             try:
-                결과, 에러 = future.result()
+                결과, 뷰심볼, 에러 = future.result()
                 if 결과: 최종_데이터.extend(결과)
+                if 뷰심볼: 최종_뷰심볼.extend(뷰심볼)
                 logger.info("   [%d/%d] %s: %s (%s)", i, len(캐드파일들), '완료' if 결과 else '패스', os.path.basename(경로), 에러 if 에러 else '성공')
             except Exception as e: logger.error("   [%d/%d] 시스템 오류: %s (%s)", i, len(캐드파일들), os.path.basename(경로), e)
-    
-    if not 최종_데이터: return pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
-    return pd.DataFrame(최종_데이터)
 
-def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
+    dwg_df = pd.DataFrame(최종_데이터) if 최종_데이터 else _빈_dwg
+    view_df = pd.DataFrame(최종_뷰심볼) if 최종_뷰심볼 else _빈_뷰
+    return dwg_df, view_df
+
+def _build_view_sheet(ws, view_df: pd.DataFrame):
+    빨간색 = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
+    헤더색 = PatternFill(start_color="FFD6E4F7", end_color="FFD6E4F7", fill_type="solid")
+    cols = {
+        "파일명": "파일명",
+        "도면명(DWG)": "도곽 도면명",
+        "축척_A1(DWG)": "도곽 A1축척",
+        "축척_A3(DWG)": "도곽 A3축척",
+        "뷰_도면명": "뷰 도면명",
+        "뷰_축척_종류": "뷰 축척종류",
+        "뷰_축척": "뷰 축척",
+        "도면명_포함": "도면명 포함",
+        "축척_일치": "축척 일치",
+        "상태": "상태",
+    }
+    df = view_df.copy()
+
+    def _chk_title(row):
+        return "O" if _title_contains_view(str(row.get("도면명(DWG)", "")), str(row.get("뷰_도면명", ""))) else "X"
+
+    def _chk_scale(row):
+        stype = str(row.get("뷰_축척_종류", "")).upper()
+        sval  = re.sub(r"[,\s]", "", str(row.get("뷰_축척", ""))).upper()
+        a1    = re.sub(r"[,\s]", "", str(row.get("축척_A1(DWG)", ""))).upper()
+        a3    = re.sub(r"[,\s]", "", str(row.get("축척_A3(DWG)", ""))).upper()
+        if not sval or sval in ("X", "NONE", ""):
+            return "?"
+        if stype == "A1": return "O" if sval == a1 else "X"
+        if stype == "A3": return "O" if sval == a3 else "X"
+        return "O" if sval in (a1, a3) else "X"
+
+    df["도면명_포함"] = df.apply(_chk_title, axis=1)
+    df["축척_일치"]  = df.apply(_chk_scale, axis=1)
+    df["상태"] = df.apply(lambda r: "일치" if r["도면명_포함"] == "O" and r["축척_일치"] == "O" else "불일치", axis=1)
+
+    col_keys = list(cols.keys())
+    for j, (key, label) in enumerate(cols.items(), 1):
+        c = ws.cell(1, j, label); c.fill = 헤더색
+    for i, row in enumerate(df[col_keys].fillna("").itertuples(index=False), 2):
+        for j, val in enumerate(row, 1):
+            ws.cell(i, j, str(val))
+        if ws.cell(i, col_keys.index("상태") + 1).value != "일치":
+            for j in range(1, len(col_keys) + 1):
+                ws.cell(i, j).fill = 빨간색
+
+def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, view_df: Optional[pd.DataFrame] = None):
     if list_df.empty and dwg_df.empty: logger.warning("[알림] 추출된 데이터가 없어 엑셀 리포트를 생성하지 않습니다."); return
 
     lst, dwg = list_df.copy(), dwg_df.copy()
@@ -733,6 +881,11 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
                 if p_v != d_v:
                     ws.cell(row, h[f"축척_{s}(LIST)"]).fill = 빨간색
                     ws.cell(row, h[f"축척_{s}(DWG)"]).fill = 빨간색
+
+    if view_df is not None and not view_df.empty:
+        ws_view = wb.create_sheet("뷰심볼 검토")
+        _build_view_sheet(ws_view, view_df)
+        logger.info("[XLSX] 뷰심볼 검토 시트 추가: %d건", len(view_df))
 
     wb.save(out_path)
     logger.info("[XLSX] 리포트 저장 완료: %s", out_path)
@@ -1017,10 +1170,10 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
             # 3. 개별도면 스캔 (Slave 블록 이름 사용 - 같으면 Master 이름)
             if master_blk != slave_blk: logger.info("💡 [스마트 탐색 모드] 개별도면은 '%s' 도곽 이름으로 탐색을 시작합니다.", slave_blk)
-            dwg_데이터 = extract_dwg_data_multiprocess(self.dwg_folders, slave_blk, roi_config, base_w, base_h, xref_texts)
+            dwg_데이터, 뷰심볼_데이터 = extract_dwg_data_multiprocess(self.dwg_folders, slave_blk, roi_config, base_w, base_h, xref_texts)
 
             # 4. 리포트 생성
-            build_report(list_데이터, dwg_데이터, 최종_저장경로)
+            build_report(list_데이터, dwg_데이터, 최종_저장경로, view_df=뷰심볼_데이터)
 
             logger.info("-" * 72)
             logger.info("[DONE] 검토 완료! 리포트가 프로그램과 같은 폴더에 저장되었습니다.")
