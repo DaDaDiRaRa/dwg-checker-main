@@ -8,9 +8,9 @@ Copyright (c) 2026 건원건축 김정현. All rights reserved.
 app.py  —  DWG 자동 검토기 v_1.7 Ultimate Edition (Kunwon Masterpiece)
 ========================================================================
 [V6.7 업데이트]
-1. Drag & Drop 완벽 지원: 윈도우 탐색기에서 파일(.dwg)이나 폴더를 마우스로 끌어서 
+1. Drag & Drop 완벽 지원: 윈도우 탐색기에서 파일(.dwg)이나 폴더를 마우스로 끌어서
    프로그램 창에 던지면(Drop) 경로가 자동으로 인식되고 세팅됩니다.
-2. 스마트 숨김형 UI (Progressive Disclosure): 평소에는 심플하게 1개의 도곽 이름만 받지만, 
+2. 스마트 숨김형 UI (Progressive Disclosure): 평소에는 심플하게 1개의 도곽 이름만 받지만,
    체크박스를 켜면 [목록표(Master) / 개별도면(Slave)] 도곽 이름을 분리해서 탐색합니다.
    (박스 좌표는 무조건 Master 기준, 개별도면 탐색은 Slave 이름 기준으로 작동)
 3. 무한 체인 정규식 (V6.6 로직 유지): AA-000-000-000 무제한 추출 완벽 적용.
@@ -98,8 +98,7 @@ def _oda_환경_설정() -> str:
 _도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[\s\-_~–—−]+\d{1,5}(?![가-힣㎡,]))*[A-Za-z]*|TOE)(?!\d|[A-Za-z]|[가-힣])")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?([\d,]+)|NONE|N/A)", re.I)
 _뷰_축척_타입_패턴 = re.compile(r'\b(A[13])\s*[-=:]\s*(1\s*/\s*[\d,]+|\d{2,5})', re.I)
-_동_패턴 = re.compile(r"((?:[0-9A-Za-z]+\s*[,~&]\s*)*[0-9A-Za-z]+동)")
-_동_제외단어 = ["인동", "주동", "공동", "자동", "수동", "전동", "연동", "이동", "작동", "부동", "진동", "명동", "구동", "개동", "각동", "해당동", "상동", "하동"]
+_동_패턴 = re.compile(r"^([0-9A-Za-z]+동)")
 
 GLOBAL_IGNORE_HEADERS = [
     "SUBJECT TITLE", "SUBJECT", "PROJECT TITLE", "PROJECT",
@@ -119,18 +118,8 @@ def _clean_text_from_headers(txt: str) -> str:
     return re.sub(r"^[-_,\s]+|[-_,\s]+$", "", clean)
 
 def _extract_dong_from_title(title: str) -> str:
-    matches = list(_동_패턴.finditer(title))
-    for m in matches:
-        dong_str = m.group(1)
-        if not any(ex_word in dong_str for ex_word in _동_제외단어): return dong_str
-    return ""
-
-def _extract_group_prefix(title: str) -> str:
-    """Return the part of title that precedes any floor/content keyword (e.g. '코어#1' from '코어#1 지하6층 평면도')."""
-    m = re.search(r"지[하상]\d*층|B\d+F?|\d+층|옥상|기초|파일", title)
-    if m and m.start() > 0:
-        return re.sub(r"[,\s]+$", "", title[:m.start()])
-    return ""
+    m = _동_패턴.match(title.strip())
+    return m.group(1) if m else ""
 
 def _도면번호_세척(raw_s: str) -> str:
     if not raw_s: return ""
@@ -254,7 +243,11 @@ def _extract_drawing_number(text: str) -> Optional[str]:
         if any(k in prefix for k in exclude_words): continue
         if prefix.endswith("도") or prefix.endswith("표") or prefix.endswith("층") or prefix.endswith("동"): continue
         if len(prefix) > 1 and all("가" <= c <= "힣" for c in prefix): continue
-        return m.group(0)
+        result = m.group(0)
+        # 번호 ROI에 혼입된 노이즈 제거: 숫자 뒤 " N" (공백+단일숫자) trailing
+        # 예) "AA-1743 0" → "AA-1743"  / 한글자씩 "1 7 4 3 0" → 영향 없음
+        result = re.sub(r'(?<=\d) [0-9]$', '', result)
+        return result if result else None
     return None
 
 def _정리문자열(txt: str) -> str:
@@ -780,13 +773,16 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                     rows, unassigned_sub_lines = [], []
                     for sub in sub_lines:
                         full_str = " ".join([t[2] for t in sub['texts']])
-                        is_category = False
-                        if any(kw in full_str.replace(" ", "") for kw in CATEGORY_KEYWORDS): is_category = True
-                        elif re.search(r"^[A-Z0-9\-_]*\s*[\[<【].+?[\]>】]\s*$", full_str): is_category = True
-                        if is_category: continue
-
                         num_texts = [t for t in sub['texts'] if abs(t[0] - header_num_x) <= abs(t[0] - header_title_x)]
                         num_str = _spatial_reconstruct_num_str(num_texts)
+                        # 도면번호가 있으면 카테고리 행으로 처리하지 않음
+                        # (예: "AA-911 외부계단 부분상세도-1" 에서 "부분상세도"가 CATEGORY_KEYWORDS에 있어도 무시)
+                        has_draw_num = bool(_extract_drawing_number(num_str) or _extract_drawing_number(full_str))
+                        is_category = False
+                        if not has_draw_num:
+                            if any(kw in full_str.replace(" ", "") for kw in CATEGORY_KEYWORDS): is_category = True
+                            elif re.search(r"^[A-Z0-9\-_]*\s*[\[<【].+?[\]>】]\s*$", full_str): is_category = True
+                        if is_category: continue
                         raw_drw_no = _extract_drawing_number(num_str) or _extract_drawing_number(full_str)
                         drw_no, raw_matched_str = "", ""
                         if raw_drw_no: drw_no = _도면번호_세척(raw_drw_no); raw_matched_str = raw_drw_no
@@ -806,7 +802,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                         if abs(closest_row['anchor_y'] - sub['y']) < 높이 * 0.04: closest_row['sub_lines'].append(sub)
 
                     avg_char_h = (sum(t[3] for t in 구역_텍스트) / len(구역_텍스트)) if 구역_텍스트 else 1.0
-                    prop_dong = "공통"; dong_title_ref_x = None
+                    prop_dong = ""; dong_title_ref_x = None
                     for row in rows:
                         row['sub_lines'].sort(key=lambda s: -s['y']); title_words, all_texts = [], []; row_min_title_x = None
                         for sub in row['sub_lines']:
@@ -827,26 +823,16 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                             all_texts.extend(sub_texts_sorted)
 
                         번호 = row['drw_no']; 명칭 = " ".join(title_words).strip()
-                        current_dong = "공통"; extracted_dong = _extract_dong_from_title(명칭)
-                        if extracted_dong and 명칭.lstrip().startswith(extracted_dong):
-                            current_dong = extracted_dong; 임시_명칭 = 명칭.replace(current_dong, "")
-                            임시_명칭 = re.sub(r"^[,\s]+|[,\s]+$", "", 임시_명칭).strip()
-                            if 임시_명칭: 명칭 = 임시_명칭
-                            gp = _extract_group_prefix(명칭)
-                            if gp:
-                                current_dong = current_dong + " " + gp
-                                명칭 = re.sub(r"^" + re.escape(gp) + r"[,\s]*", "", 명칭).strip()
-                            prop_dong = current_dong; dong_title_ref_x = row_min_title_x
-                        elif (dong_title_ref_x is not None and row_min_title_x is not None
-                              and row_min_title_x > dong_title_ref_x + avg_char_h * 1.5):
-                            current_dong = prop_dong
+                        extracted_dong = _extract_dong_from_title(명칭)
+                        if extracted_dong:
+                            current_dong = extracted_dong
+                            명칭 = re.sub(r"^" + re.escape(extracted_dong) + r"\s*", "", 명칭).strip()
+                            prop_dong = current_dong
                         else:
-                            gp = _extract_group_prefix(명칭)
-                            if gp: prop_dong = gp; dong_title_ref_x = row_min_title_x
-                            else: prop_dong = "공통"; dong_title_ref_x = None
+                            current_dong = prop_dong
 
                         a1, a3 = _extract_scale_smart(all_texts, header_a1_x, header_a3_x, is_list_table=True)
-                        데이터.append({"도면번호(LIST)": 번호, "구분_LIST(동)": current_dong if current_dong != "공통" else "", "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
+                        데이터.append({"도면번호(LIST)": 번호, "구분_LIST(동)": current_dong, "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
     except Exception as e: logger.error("목록표 분석 중 오류: %s", e)
     df = pd.DataFrame(데이터)
     return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(동)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"]) if df.empty else df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
@@ -918,9 +904,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                 if raw_matched_str and raw_matched_str in 명칭: 명칭 = 명칭.replace(raw_matched_str, "")
                 dwg_dong = _extract_dong_from_title(명칭)
                 if dwg_dong:
-                    임시_명칭 = 명칭.replace(dwg_dong, "")
-                    임시_명칭 = re.sub(r"^[,\s]+|[,\s]+$", "", 임시_명칭).strip()
-                    if 임시_명칭: 명칭 = 임시_명칭
+                    명칭 = re.sub(r"^" + re.escape(dwg_dong) + r"\s*", "", 명칭).strip()
                     
                 명칭 = _clean_title_only(명칭); a1, a3 = _extract_scale_smart(s_texts, is_list_table=False)
                 if 번호:
@@ -1166,7 +1150,7 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         logger.addHandler(gui_handler)
 
         logger.info("=" * 72)
-        logger.info(" AutoDWG 검토 자동화 시스템  v6.7 _ © 2026. 김정현. All rights reserved.")
+        logger.info(" AutoDWG 검토 자동화 시스템  v6.8 _ © 2026. 김정현. All rights reserved.")
         logger.info("=" * 72)
         logger.info(" 환영합니다! 파일이나 폴더를 '드래그 앤 드롭' 하거나 버튼으로 추가하세요.\n")
 
@@ -1198,7 +1182,7 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         inn.pack(fill="both", expand=True, padx=22)
         ctk.CTkLabel(inn, text="AutoDWG  검토 자동화 시스템",
                      font=F_H1, text_color="white", anchor="w").pack(side="left", fill="y")
-        ctk.CTkLabel(inn, text="v 6.7 _ © 2026. 김정현. All rights reserved.", font=F_SM,
+        ctk.CTkLabel(inn, text="v 6.8 _ © 2026. 김정현. All rights reserved.", font=F_SM,
                      text_color="#a8c8ff", anchor="e").pack(side="right")
 
         page = ctk.CTkScrollableFrame(self, fg_color=BG,
