@@ -97,7 +97,7 @@ def _oda_환경_설정() -> str:
 # ============================================================================
 _도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[\s\-_~–—−]+\d{1,5}(?![가-힣㎡,]))*[A-Za-z]*|TOE)(?!\d|[A-Za-z]|[가-힣])")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?([\d,]+)|NONE|N/A)", re.I)
-_뷰_축척_타입_패턴 = re.compile(r'\b(A[13])\s*[=:]\s*(1\s*/\s*[\d,]+)', re.I)
+_뷰_축척_타입_패턴 = re.compile(r'\b(A[13])\s*[-=:]\s*(1\s*/\s*[\d,]+|\d{2,5})', re.I)
 _동_패턴 = re.compile(r"((?:[0-9A-Za-z]+\s*[,~&]\s*)*[0-9A-Za-z]+동)")
 _동_제외단어 = ["인동", "주동", "공동", "자동", "수동", "전동", "연동", "이동", "작동", "부동", "진동", "명동", "구동", "개동", "각동", "해당동", "상동", "하동"]
 
@@ -235,10 +235,16 @@ def _merge_title_char_runs(s: str) -> str:
 
 def _축척_텍스트_정리(txt: str) -> str:
     if not txt: return "X"
-    u = txt.upper()
+    u = txt.strip().upper()
     if "NONE" in u or "N/A" in u: return "NONE"
     m = _축척_패턴.search(u)
-    return f"1/{m.group(2).replace(',', '')}" if m and m.group(2) else "X"
+    if m and m.group(2):
+        return f"1/{m.group(2).replace(',', '')}"
+    # "A3:100" 처럼 분자 없이 분모만 있는 경우 (예: "100" → "1/100")
+    plain = re.sub(r'[,\s]', '', u)
+    if re.match(r'^\d+$', plain):
+        return f"1/{plain}"
+    return "X"
 
 def _extract_drawing_number(text: str) -> Optional[str]:
     for m in _도면번호_패턴.finditer(text):
@@ -390,7 +396,8 @@ def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: f
     y_max = iy + base_h * yscale * view_roi[3]
 
     def _in_roi(tx, ty):
-        return x_min <= float(tx) <= x_max and y_min <= float(ty) <= y_max
+        ux, uy = _unrot(float(tx), float(ty))
+        return x_min <= ux <= x_max and y_min <= uy <= y_max
 
     # view_symbol_roi 박스 안의 TEXT/MTEXT만 수집
     # (박스 밖 도곽 텍스트가 섞이지 않도록 ROI 경계를 엄격히 적용)
@@ -500,32 +507,33 @@ def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: f
         # 수평선이 원 중심을 통과하므로 line_y = cy
         line_y = cy
 
-        # 도면명: view_roi 박스 안, line_y 위쪽, 한글 포함 → 가장 가까운 것
-        # (all_texts는 이미 ROI 안으로 필터링돼 있으므로 별도 x/y 마진 불필요)
+        # 도면명: view_roi 박스 안, line_y 위쪽, 한글 포함 → 원 중심으로부터 2D 거리 가장 가까운 것
+        # 수직 거리만 쓰면 같은 높이에 나란히 있는 뷰심볼들이 서로의 제목을 가로챔
         title_cands = []
-        for _, ty, txt in all_texts:
+        for tx, ty, txt in all_texts:
             if ty <= line_y:
                 continue
             if not re.search(r'[가-힣]', txt) or len(txt.replace(' ', '')) < 3:
                 continue
-            title_cands.append((ty - line_y, txt))
+            title_cands.append((math.hypot(tx - cx, ty - line_y), txt))
         title_text = _정리문자열(min(title_cands, key=lambda t: t[0])[1]) if title_cands else ""
 
-        # 축척: view_roi 박스 안, line_y 아래쪽, 패턴 매칭 → 가장 가까운 것
-        scale_type = scale_val = ""
+        # 축척: view_roi 박스 안, line_y 아래쪽, 패턴 매칭 → 원 중심으로부터 2D 거리 가장 가까운 것
+        # finditer 사용: 한 텍스트에 "A1:1/600, A3:1/1200" 처럼 두 값이 함께 있어도 모두 추출
         scale_cands = []
-        for _, ty, txt in all_texts:
+        for tx, ty, txt in all_texts:
             if ty >= line_y:
                 continue
-            m = _뷰_축척_타입_패턴.search(txt)
-            if m:
-                scale_cands.append((line_y - ty, m.group(1).upper(), _축척_텍스트_정리(m.group(2))))
-        if scale_cands:
-            _, scale_type, scale_val = min(scale_cands, key=lambda t: t[0])
+            for m in _뷰_축척_타입_패턴.finditer(txt):
+                scale_cands.append((math.hypot(tx - cx, line_y - ty), m.group(1).upper(), _축척_텍스트_정리(m.group(2))))
+        a1_cands = [(d, v) for d, t, v in scale_cands if t == "A1"]
+        a3_cands = [(d, v) for d, t, v in scale_cands if t == "A3"]
+        scale_a1 = min(a1_cands, key=lambda t: t[0])[1] if a1_cands else ""
+        scale_a3 = min(a3_cands, key=lambda t: t[0])[1] if a3_cands else ""
 
         # 도면명과 축척 둘 다 있어야 유효한 뷰심볼 (하나만 있으면 오탐으로 간주)
-        if title_text and scale_val:
-            symbols.append({'뷰_도면명': title_text, '뷰_축척_종류': scale_type, '뷰_축척': scale_val,
+        if title_text and (scale_a1 or scale_a3):
+            symbols.append({'뷰_도면명': title_text, '뷰_A1축척': scale_a1, '뷰_A3축척': scale_a3,
                             '_cx': round(cx, 1), '_cy': round(cy, 1)})
 
     # ── ATTRIB 기반 뷰심볼 처리 ──────────────────────────────────────────────
@@ -584,20 +592,20 @@ def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: f
                             if re.search(r'[가-힣]', atxt) and len(atxt.replace(' ', '')) >= 3:
                                 title_cands2.append((aty - line_y2, atxt))
                         else:
-                            m = _뷰_축척_타입_패턴.search(atxt)
-                            if m:
+                            for m in _뷰_축척_타입_패턴.finditer(atxt):
                                 scale_cands2.append((line_y2 - aty, m.group(1).upper(), _축척_텍스트_정리(m.group(2))))
                     except Exception:
                         pass
 
                 title_text2 = _정리문자열(min(title_cands2, key=lambda t: t[0])[1]) if title_cands2 else ""
-                scale_type2 = scale_val2 = ""
-                if scale_cands2:
-                    _, scale_type2, scale_val2 = min(scale_cands2, key=lambda t: t[0])
+                a1_cands2 = [(d, v) for d, t, v in scale_cands2 if t == "A1"]
+                a3_cands2 = [(d, v) for d, t, v in scale_cands2 if t == "A3"]
+                scale_a1_2 = min(a1_cands2, key=lambda t: t[0])[1] if a1_cands2 else ""
+                scale_a3_2 = min(a3_cands2, key=lambda t: t[0])[1] if a3_cands2 else ""
 
-                if title_text2 and scale_val2:
+                if title_text2 and (scale_a1_2 or scale_a3_2):
                     seen.add(key)
-                    symbols.append({'뷰_도면명': title_text2, '뷰_축척_종류': scale_type2, '뷰_축척': scale_val2,
+                    symbols.append({'뷰_도면명': title_text2, '뷰_A1축척': scale_a1_2, '뷰_A3축척': scale_a3_2,
                                     '_cx': round(ipx, 1), '_cy': round(ipy, 1)})
             except Exception:
                 pass
@@ -941,7 +949,7 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str,
         if 폴더.exists(): 모든_캐드파일.extend([str(p) for p in 폴더.iterdir() if p.is_file() and p.suffix.lower() in [".dwg", ".dxf"]])
     캐드파일들 = sorted(list(set(모든_캐드파일)))
     _빈_dwg = pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
-    _빈_뷰 = pd.DataFrame(columns=["파일명", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "뷰_도면명", "뷰_축척_종류", "뷰_축척"])
+    _빈_뷰 = pd.DataFrame(columns=["파일명", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "뷰_도면명", "뷰_A1축척", "뷰_A3축척"])
     if not 캐드파일들:
         logger.warning("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return _빈_dwg, _빈_뷰
 
@@ -971,8 +979,8 @@ def _build_view_sheet(ws, view_df: pd.DataFrame):
         "축척_A1(DWG)": "도곽 A1축척",
         "축척_A3(DWG)": "도곽 A3축척",
         "뷰_도면명": "뷰 도면명",
-        "뷰_축척_종류": "뷰 축척종류",
-        "뷰_축척": "뷰 축척",
+        "뷰_A1축척": "뷰 A1축척",
+        "뷰_A3축척": "뷰 A3축척",
         "도면명_포함": "도면명 포함",
         "축척_일치": "축척 일치",
         "상태": "상태",
@@ -983,19 +991,32 @@ def _build_view_sheet(ws, view_df: pd.DataFrame):
         return "O" if _title_contains_view(str(row.get("도면명(DWG)", "")), str(row.get("뷰_도면명", ""))) else "X"
 
     def _chk_scale(row):
-        stype = str(row.get("뷰_축척_종류", "")).upper()
-        sval  = re.sub(r"[,\s]", "", str(row.get("뷰_축척", ""))).upper()
-        a1    = re.sub(r"[,\s]", "", str(row.get("축척_A1(DWG)", ""))).upper()
-        a3    = re.sub(r"[,\s]", "", str(row.get("축척_A3(DWG)", ""))).upper()
-        if not sval or sval in ("X", "NONE", ""):
+        v_a1 = re.sub(r"[,\s]", "", str(row.get("뷰_A1축척", ""))).upper()
+        v_a3 = re.sub(r"[,\s]", "", str(row.get("뷰_A3축척", ""))).upper()
+        d_a1 = re.sub(r"[,\s]", "", str(row.get("축척_A1(DWG)", ""))).upper()
+        d_a3 = re.sub(r"[,\s]", "", str(row.get("축척_A3(DWG)", ""))).upper()
+        if not v_a1 and not v_a3:
             return "?"
-        if stype == "A1": return "O" if sval == a1 else "X"
-        if stype == "A3": return "O" if sval == a3 else "X"
-        return "O" if sval in (a1, a3) else "X"
+        results = []
+        if v_a1 and v_a1 not in ("X", "NONE"):
+            results.append(v_a1 == d_a1)
+        if v_a3 and v_a3 not in ("X", "NONE"):
+            results.append(v_a3 == d_a3)
+        if not results:
+            return "?"
+        return "O" if all(results) else "X"
 
     df["도면명_포함"] = df.apply(_chk_title, axis=1)
     df["축척_일치"]  = df.apply(_chk_scale, axis=1)
-    df["상태"] = df.apply(lambda r: "일치" if r["도면명_포함"] == "O" and r["축척_일치"] == "O" else "불일치", axis=1)
+    def _view_status(r):
+        title_ok = r["도면명_포함"] == "O"
+        scale_ok = r["축척_일치"] == "O"
+        if title_ok and scale_ok: return "일치"
+        parts = []
+        if not title_ok: parts.append("도면명")
+        if not scale_ok: parts.append("축척")
+        return "/".join(parts) + " 불일치"
+    df["상태"] = df.apply(_view_status, axis=1)
 
     # 같은 파일 내에서 뷰 도면명이 중복이면 오타 가능성 → "중복" 상태로 덮어쓰기
     dup_mask = df.duplicated(subset=["파일명", "뷰_도면명"], keep=False)
@@ -1058,32 +1079,46 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, vie
     
     결과[cols].fillna("X").to_excel(out_path, index=False)
     wb = load_workbook(out_path); ws = wb.active
+    ws.title = "목록표 검토"
     빨간색 = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
     h = {cell.value: cell.column for cell in ws[1] if cell.value}
-    
+
     for row in range(2, ws.max_row + 1):
-        if ws.cell(row, h["상태"]).value != "일치":
+        status = ws.cell(row, h["상태"]).value
+        if status in ("DWG 누락", "목록표 누락"):
             for c in range(1, len(cols)+1): ws.cell(row, c).fill = 빨간색
-        else:
-            if row in dong_mismatch_indices:
-                if h.get("구분_LIST(동)"): ws.cell(row, h.get("구분_LIST(동)")).fill = 빨간색
-                if h.get("구분_DWG(동)"): ws.cell(row, h.get("구분_DWG(동)")).fill = 빨간색
-            val_list = re.sub(r"[\s\-_]", "", str(ws.cell(row, h.get("도면번호(LIST)")).value).upper())
-            val_dwg = re.sub(r"[\s\-_]", "", str(ws.cell(row, h.get("도면번호(DWG)")).value).upper())
-            if val_list != val_dwg:
-                ws.cell(row, h.get("도면번호(LIST)")).fill = 빨간색
-                ws.cell(row, h.get("도면번호(DWG)")).fill = 빨간색
-            name_list = str(ws.cell(row, h.get("도면명(LIST)")).value).replace(" ", "")
-            name_dwg = str(ws.cell(row, h.get("도면명(DWG)")).value).replace(" ", "")
-            if name_list != name_dwg:
-                ws.cell(row, h.get("도면명(LIST)")).fill = 빨간색
-                ws.cell(row, h.get("도면명(DWG)")).fill = 빨간색
-            for s in ["A1", "A3"]:
-                p_v = str(ws.cell(row, h[f"축척_{s}(LIST)"]).value).replace(" ","")
-                d_v = str(ws.cell(row, h[f"축척_{s}(DWG)"]).value).replace(" ","")
-                if p_v != d_v:
-                    ws.cell(row, h[f"축척_{s}(LIST)"]).fill = 빨간색
-                    ws.cell(row, h[f"축척_{s}(DWG)"]).fill = 빨간색
+            continue
+
+        issues = []
+        if row in dong_mismatch_indices:
+            issues.append("동")
+            if h.get("구분_LIST(동)"): ws.cell(row, h["구분_LIST(동)"]).fill = 빨간색
+            if h.get("구분_DWG(동)"): ws.cell(row, h["구분_DWG(동)"]).fill = 빨간색
+        val_list = re.sub(r"[\s\-_]", "", str(ws.cell(row, h["도면번호(LIST)"]).value).upper())
+        val_dwg  = re.sub(r"[\s\-_]", "", str(ws.cell(row, h["도면번호(DWG)"]).value).upper())
+        if val_list != val_dwg:
+            issues.append("도면번호")
+            ws.cell(row, h["도면번호(LIST)"]).fill = 빨간색
+            ws.cell(row, h["도면번호(DWG)"]).fill  = 빨간색
+        name_list = str(ws.cell(row, h["도면명(LIST)"]).value).replace(" ", "")
+        name_dwg  = str(ws.cell(row, h["도면명(DWG)"]).value).replace(" ", "")
+        if name_list != name_dwg:
+            issues.append("도면명")
+            ws.cell(row, h["도면명(LIST)"]).fill = 빨간색
+            ws.cell(row, h["도면명(DWG)"]).fill  = 빨간색
+        scale_bad = False
+        for s in ["A1", "A3"]:
+            p_v = str(ws.cell(row, h[f"축척_{s}(LIST)"]).value).replace(" ","")
+            d_v = str(ws.cell(row, h[f"축척_{s}(DWG)"]).value).replace(" ","")
+            if p_v != d_v:
+                scale_bad = True
+                ws.cell(row, h[f"축척_{s}(LIST)"]).fill = 빨간색
+                ws.cell(row, h[f"축척_{s}(DWG)"]).fill  = 빨간색
+        if scale_bad:
+            issues.append("축척")
+        if issues:
+            ws.cell(row, h["상태"]).value = "/".join(issues) + " 불일치"
+            ws.cell(row, h["상태"]).fill  = 빨간색
 
     if view_df is not None and not view_df.empty:
         ws_view = wb.create_sheet("뷰심볼 검토")
