@@ -821,41 +821,42 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                         if abs(closest_row['anchor_y'] - sub['y']) < 높이 * 0.04: closest_row['sub_lines'].append(sub)
 
                     avg_char_h = (sum(t[3] for t in 구역_텍스트) / len(구역_텍스트)) if 구역_텍스트 else 1.0
-                    prop_group = ""; dong_title_ref_x = None
-                    for row in rows:
-                        row['sub_lines'].sort(key=lambda s: -s['y']); title_words, all_texts = [], []; row_min_title_x = None
-                        for sub in row['sub_lines']:
-                            sub_texts_sorted = sorted(sub['texts'], key=lambda x: x[0]); title_texts = []
-                            for t in sub_texts_sorted:
-                                if header_remark_x and abs(t[0] - header_remark_x) < abs(t[0] - header_title_x): continue
-                                title_texts.append(t)
-                            if title_texts:
-                                sub_min_x = min(t[0] for t in title_texts)
-                                if row_min_title_x is None or sub_min_x < row_min_title_x: row_min_title_x = sub_min_x
-                            raw_left_str = _spatial_reconstruct_num_str(title_texts)
-                            title_overflow = raw_left_str
-                            if sub.get('raw_drw_no') and sub['raw_drw_no'] in raw_left_str:
-                                parts = raw_left_str.split(sub['raw_drw_no'], 1); title_overflow = parts[1] if len(parts) > 1 else ""
-                            title_overflow = _merge_title_char_runs(title_overflow)
-                            cleaned_line = _clean_title_only(title_overflow)
-                            if cleaned_line: title_words.append(cleaned_line)
-                            all_texts.extend(sub_texts_sorted)
 
-                        번호 = row['drw_no']; 명칭 = " ".join(title_words).strip()
-                        extracted_dong = _extract_dong_from_title(명칭)
-                        extracted_group = _extract_group_from_title(명칭) if not extracted_dong else ""
-                        current_group = extracted_dong or extracted_group
-                        if current_group:
-                            # 동 제거 (있으면)
-                            if extracted_dong:
-                                명칭 = re.sub(r"^" + re.escape(extracted_dong) + r"\s*", "", 명칭).strip()
-                            # 그룹 제거 (있으면)
-                            if extracted_group:
-                                명칭 = re.sub(r"^" + re.escape(extracted_group) + r"\s*", "", 명칭).strip()
-                            prop_group = current_group
+                    # 1차 패스: 모든 행의 도면명과 그룹 후보를 미리 계산
+                    precomputed = []
+                    for row in rows:
+                        row['sub_lines'].sort(key=lambda s: -s['y']); pw, at = [], []
+                        for sub in row['sub_lines']:
+                            sts = sorted(sub['texts'], key=lambda x: x[0])
+                            tt = [t for t in sts if not (header_remark_x and abs(t[0] - header_remark_x) < abs(t[0] - header_title_x))]
+                            rls = _spatial_reconstruct_num_str(tt); to = rls
+                            if sub.get('raw_drw_no') and sub['raw_drw_no'] in rls:
+                                parts = rls.split(sub['raw_drw_no'], 1); to = parts[1] if len(parts) > 1 else ""
+                            to = _merge_title_char_runs(to); cl = _clean_title_only(to)
+                            if cl: pw.append(cl)
+                            at.extend(sts)
+                        m = " ".join(pw).strip()
+                        ed = _extract_dong_from_title(m); eg = _extract_group_from_title(m) if not ed else ""
+                        precomputed.append({'drw_no': row['drw_no'], 'title': m, 'dong': ed, 'group': eg, 'candidate': ed or eg, 'all_texts': at})
+
+                    # 2차 패스: 연속 행에 같은 후보가 반복되면 그룹이 아닌 도면명의 일부로 처리
+                    prop_group = ""
+                    for i, pc in enumerate(precomputed):
+                        번호 = pc['drw_no']; 명칭 = pc['title']
+                        extracted_dong = pc['dong']; extracted_group = pc['group']; candidate = pc['candidate']
+                        all_texts = pc['all_texts']
+                        if candidate:
+                            prev_cand = precomputed[i - 1]['candidate'] if i > 0 else ""
+                            next_cand = precomputed[i + 1]['candidate'] if i + 1 < len(precomputed) else ""
+                            if next_cand == candidate or prev_cand == candidate:
+                                # 이전/다음 행도 같은 접두어 → 그룹이 아닌 도면명의 일부
+                                current_group = prop_group
+                            else:
+                                if extracted_dong: 명칭 = re.sub(r"^" + re.escape(extracted_dong) + r"\s*", "", 명칭).strip()
+                                if extracted_group: 명칭 = re.sub(r"^" + re.escape(extracted_group) + r"\s*", "", 명칭).strip()
+                                prop_group = candidate; current_group = candidate
                         else:
                             current_group = prop_group
-
                         a1, a3 = _extract_scale_smart(all_texts, header_a1_x, header_a3_x, is_list_table=True)
                         데이터.append({"도면번호(LIST)": 번호, "구분_LIST(그룹)": current_group, "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
     except Exception as e: logger.error("목록표 분석 중 오류: %s", e)
