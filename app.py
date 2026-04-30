@@ -121,6 +121,25 @@ def _extract_dong_from_title(title: str) -> str:
     m = _동_패턴.match(title.strip())
     return m.group(1) if m else ""
 
+def _extract_group_from_title(title: str) -> str:
+    """동/그룹 정보 추출. 동을 먼저 제거한 후 남은 텍스트의 첫 토큰이 그룹인지 판단."""
+    title = title.strip()
+    # 동을 먼저 제거
+    m = _동_패턴.match(title)
+    if m:
+        title = title[len(m.group(1)):].strip()
+    if not title:
+        return ""
+    # 첫 토큰만 추출 (공백까지)
+    first_token = title.split(None, 1)[0]
+    # 도면명 특징: 숫자, 영문대문자, 특수문자 포함
+    # 그룹: 순수 한글만 있음
+    if re.search(r"\d|[A-Z]|[#\-_\(\)\[\]]", first_token):
+        return ""  # 도면명으로 시작 → 그룹 없음
+    if re.match(r"^[가-힣]+$", first_token):
+        return first_token  # 순수 한글 → 그룹
+    return ""
+
 def _도면번호_세척(raw_s: str) -> str:
     if not raw_s: return ""
     suffix_m = re.search(r"[a-z]+$", raw_s.strip())
@@ -802,7 +821,7 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                         if abs(closest_row['anchor_y'] - sub['y']) < 높이 * 0.04: closest_row['sub_lines'].append(sub)
 
                     avg_char_h = (sum(t[3] for t in 구역_텍스트) / len(구역_텍스트)) if 구역_텍스트 else 1.0
-                    prop_dong = ""; dong_title_ref_x = None
+                    prop_group = ""; dong_title_ref_x = None
                     for row in rows:
                         row['sub_lines'].sort(key=lambda s: -s['y']); title_words, all_texts = [], []; row_min_title_x = None
                         for sub in row['sub_lines']:
@@ -824,18 +843,24 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
 
                         번호 = row['drw_no']; 명칭 = " ".join(title_words).strip()
                         extracted_dong = _extract_dong_from_title(명칭)
-                        if extracted_dong:
-                            current_dong = extracted_dong
-                            명칭 = re.sub(r"^" + re.escape(extracted_dong) + r"\s*", "", 명칭).strip()
-                            prop_dong = current_dong
+                        extracted_group = _extract_group_from_title(명칭) if not extracted_dong else ""
+                        current_group = extracted_dong or extracted_group
+                        if current_group:
+                            # 동 제거 (있으면)
+                            if extracted_dong:
+                                명칭 = re.sub(r"^" + re.escape(extracted_dong) + r"\s*", "", 명칭).strip()
+                            # 그룹 제거 (있으면)
+                            if extracted_group:
+                                명칭 = re.sub(r"^" + re.escape(extracted_group) + r"\s*", "", 명칭).strip()
+                            prop_group = current_group
                         else:
-                            current_dong = prop_dong
+                            current_group = prop_group
 
                         a1, a3 = _extract_scale_smart(all_texts, header_a1_x, header_a3_x, is_list_table=True)
-                        데이터.append({"도면번호(LIST)": 번호, "구분_LIST(동)": current_dong, "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
+                        데이터.append({"도면번호(LIST)": 번호, "구분_LIST(그룹)": current_group, "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
     except Exception as e: logger.error("목록표 분석 중 오류: %s", e)
     df = pd.DataFrame(데이터)
-    return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(동)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"]) if df.empty else df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
+    return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(그룹)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"]) if df.empty else df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
 
 def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[float, float, str, float]]]) -> Tuple[List[dict], List[dict], str]:
     전체경로, 목표블록, roi_cfg, base_w, base_h, xref_texts = args
@@ -903,12 +928,16 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                 명칭 = t_str_clean
                 if raw_matched_str and raw_matched_str in 명칭: 명칭 = 명칭.replace(raw_matched_str, "")
                 dwg_dong = _extract_dong_from_title(명칭)
+                dwg_group = _extract_group_from_title(명칭) if not dwg_dong else ""
+                dwg_group_info = dwg_dong or dwg_group
                 if dwg_dong:
                     명칭 = re.sub(r"^" + re.escape(dwg_dong) + r"\s*", "", 명칭).strip()
-                    
+                if dwg_group:
+                    명칭 = re.sub(r"^" + re.escape(dwg_group) + r"\s*", "", 명칭).strip()
+
                 명칭 = _clean_title_only(명칭); a1, a3 = _extract_scale_smart(s_texts, is_list_table=False)
                 if 번호:
-                    데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "구분_DWG(동)": dwg_dong, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
+                    데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "구분_DWG(그룹)": dwg_group_info, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
                     # 도곽마다 해당 위치 기준의 ROI에서 뷰 심볼 추출
                     # seen_circles로 ROI 중복 시 같은 원이 두 번 들어가는 것을 방지
                     if view_roi:
@@ -932,7 +961,7 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str,
         폴더 = Path(d)
         if 폴더.exists(): 모든_캐드파일.extend([str(p) for p in 폴더.iterdir() if p.is_file() and p.suffix.lower() in [".dwg", ".dxf"]])
     캐드파일들 = sorted(list(set(모든_캐드파일)))
-    _빈_dwg = pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
+    _빈_dwg = pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(그룹)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
     _빈_뷰 = pd.DataFrame(columns=["파일명", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "뷰_도면명", "뷰_A1축척", "뷰_A3축척"])
     if not 캐드파일들:
         logger.warning("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return _빈_dwg, _빈_뷰
@@ -1027,37 +1056,37 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, vie
     lst, dwg = list_df.copy(), dwg_df.copy()
     if "도면번호(LIST)" not in lst.columns: lst["도면번호(LIST)"] = ""
     if "도면번호(DWG)" not in dwg.columns: dwg["도면번호(DWG)"] = ""
-    if "구분_LIST(동)" not in lst.columns: lst["구분_LIST(동)"] = ""
-    if "구분_DWG(동)" not in dwg.columns: dwg["구분_DWG(동)"] = ""
+    if "구분_LIST(그룹)" not in lst.columns: lst["구분_LIST(그룹)"] = ""
+    if "구분_DWG(그룹)" not in dwg.columns: dwg["구분_DWG(그룹)"] = ""
 
     lst["KEY"] = lst["도면번호(LIST)"].astype(str).str.upper().str.replace(r"[\s\-_]", "", regex=True)
     dwg["KEY"] = dwg["도면번호(DWG)"].astype(str).str.upper().str.replace(r"[\s\-_]", "", regex=True)
     결과 = pd.merge(lst, dwg, on="KEY", how="outer", indicator=True)
     결과["상태"] = 결과["_merge"].map({"both": "일치", "left_only": "DWG 누락", "right_only": "목록표 누락"})
 
-    dong_mismatch_indices = set()
+    group_mismatch_indices = set()
     for i in range(len(결과)):
-        l_d = str(결과.at[i, "구분_LIST(동)"]).strip(); d_d = str(결과.at[i, "구분_DWG(동)"]).strip()
-        if l_d == "nan": l_d = ""
-        if d_d == "nan": d_d = ""
-        if l_d and d_d and l_d != d_d: dong_mismatch_indices.add(i + 2)
+        l_g = str(결과.at[i, "구분_LIST(그룹)"]).strip(); d_g = str(결과.at[i, "구분_DWG(그룹)"]).strip()
+        if l_g == "nan": l_g = ""
+        if d_g == "nan": d_g = ""
+        if l_g and d_g and l_g != d_g: group_mismatch_indices.add(i + 2)
 
-    prev_dong = ""; dong_col_idx = 결과.columns.get_loc("구분_LIST(동)")
+    prev_group = ""; group_col_idx = 결과.columns.get_loc("구분_LIST(그룹)")
     for i in range(len(결과)):
-        curr_dong = str(결과.iat[i, dong_col_idx]).strip()
-        if curr_dong == "nan" or not curr_dong: prev_dong = ""; 결과.iat[i, dong_col_idx] = ""; continue
-        if curr_dong == prev_dong: 결과.iat[i, dong_col_idx] = ""  
-        else: prev_dong = curr_dong          
+        curr_group = str(결과.iat[i, group_col_idx]).strip()
+        if curr_group == "nan" or not curr_group: prev_group = ""; 결과.iat[i, group_col_idx] = ""; continue
+        if curr_group == prev_group: 결과.iat[i, group_col_idx] = ""
+        else: prev_group = curr_group
 
-    prev_dwg_dong = ""; dwg_dong_col_idx = 결과.columns.get_loc("구분_DWG(동)")
+    prev_dwg_group = ""; dwg_group_col_idx = 결과.columns.get_loc("구분_DWG(그룹)")
     for i in range(len(결과)):
-        curr_dong = str(결과.iat[i, dwg_dong_col_idx]).strip()
-        if curr_dong == "nan" or not curr_dong: prev_dwg_dong = ""; 결과.iat[i, dwg_dong_col_idx] = ""; continue
-        if curr_dong == prev_dwg_dong: 결과.iat[i, dwg_dong_col_idx] = ""  
-        else: prev_dwg_dong = curr_dong          
+        curr_group = str(결과.iat[i, dwg_group_col_idx]).strip()
+        if curr_group == "nan" or not curr_group: prev_dwg_group = ""; 결과.iat[i, dwg_group_col_idx] = ""; continue
+        if curr_group == prev_dwg_group: 결과.iat[i, dwg_group_col_idx] = ""
+        else: prev_dwg_group = curr_group
 
-    cols = ["도면번호(LIST)", "구분_LIST(동)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)", 
-            "도면번호(DWG)", "구분_DWG(동)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "파일명", "상태"]
+    cols = ["도면번호(LIST)", "구분_LIST(그룹)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)",
+            "도면번호(DWG)", "구분_DWG(그룹)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "파일명", "상태"]
     for c in cols: 
         if c not in 결과.columns: 결과[c] = ""
     
@@ -1074,10 +1103,10 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, vie
             continue
 
         issues = []
-        if row in dong_mismatch_indices:
-            issues.append("동")
-            if h.get("구분_LIST(동)"): ws.cell(row, h["구분_LIST(동)"]).fill = 빨간색
-            if h.get("구분_DWG(동)"): ws.cell(row, h["구분_DWG(동)"]).fill = 빨간색
+        if row in group_mismatch_indices:
+            issues.append("그룹")
+            if h.get("구분_LIST(그룹)"): ws.cell(row, h["구분_LIST(그룹)"]).fill = 빨간색
+            if h.get("구분_DWG(그룹)"): ws.cell(row, h["구분_DWG(그룹)"]).fill = 빨간색
         val_list = re.sub(r"[\s\-_]", "", str(ws.cell(row, h["도면번호(LIST)"]).value).upper())
         val_dwg  = re.sub(r"[\s\-_]", "", str(ws.cell(row, h["도면번호(DWG)"]).value).upper())
         if val_list != val_dwg:
