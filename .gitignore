@@ -16,6 +16,11 @@ report.xlsx
 .idea/
 .vscode/
 
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
 # eeee
 venv/
 __pycache__/
