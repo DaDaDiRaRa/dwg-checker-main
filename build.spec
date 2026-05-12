@@ -3,16 +3,13 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 datas, binaries, hiddenimports = [], [], []
 
-# customtkinter — 테마/이미지 에셋 포함
+# customtkinter/tkinterdnd2 — theme/image assets
 for pkg in ('customtkinter', 'tkinterdnd2'):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
 
-# ezdxf — 폰트, 리소스 데이터
+# ezdxf — font and resource data
 datas += collect_data_files('ezdxf')
-
-# pdfminer — cmap 파일 (pdfplumber 의존)
-datas += collect_data_files('pdfminer')
 
 a = Analysis(
     ['app.py'],
@@ -22,7 +19,6 @@ a = Analysis(
     hiddenimports=hiddenimports + [
         'ezdxf',
         'ezdxf.addons',
-        'pdfplumber',
         'openpyxl',
         'openpyxl.styles',
         'pandas',
@@ -45,7 +41,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='도면검토기',
+    name='DWGChecker',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

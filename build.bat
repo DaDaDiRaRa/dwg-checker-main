@@ -1,35 +1,34 @@
 @echo off
-chcp 65001 > nul
 echo ========================================
-echo   AutoDWG 도면검토기 EXE 빌드 시작
+echo   AutoDWG Checker - EXE Build Start
 echo ========================================
 
-:: 이전 빌드 결과물 정리
-if exist "dist\도면검토기.exe" (
-    del /f /q "dist\도면검토기.exe"
-    echo [정리] 이전 EXE 삭제 완료
+:: Remove previous build artifacts
+if exist "dist" (
+    rmdir /s /q "dist"
+    echo [Clean] dist folder removed
 )
 if exist "build" (
     rmdir /s /q "build"
-    echo [정리] build 폴더 삭제 완료
+    echo [Clean] build folder removed
 )
 
 echo.
-echo [빌드] PyInstaller 실행 중... (수 분 소요)
+echo [Build] Running PyInstaller... (may take a few minutes)
 echo.
 
 venv\Scripts\pyinstaller.exe --clean build.spec
 
 echo.
-if exist "dist\도면검토기.exe" (
+if exist "dist\DWGChecker.exe" (
     echo ========================================
-    echo   빌드 성공!
-    echo   dist\도면검토기.exe 생성 완료
+    echo   BUILD SUCCESS!
+    echo   dist\DWGChecker.exe created
     echo ========================================
     explorer dist
 ) else (
     echo ========================================
-    echo   빌드 실패. 위 오류 메시지를 확인하세요.
+    echo   BUILD FAILED. Check errors above.
     echo ========================================
 )
 
