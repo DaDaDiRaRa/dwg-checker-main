@@ -18,7 +18,7 @@ app.py  —  DWG 자동 검토기 v_1.7 Ultimate Edition (Kunwon Masterpiece)
 """
 
 from __future__ import annotations
-import glob, os, re, sys, webbrowser, json, math, logging
+import glob, os, re, sys, webbrowser, json, math, logging, traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
@@ -84,12 +84,14 @@ def _oda_환경_설정() -> str:
         폴더경로 = os.path.dirname(found_path)
         if 폴더경로 not in os.environ.get("PATH", ""):
             os.environ["PATH"] = 폴더경로 + os.pathsep + os.environ.get("PATH", "")
+        # 직접 속성 설정만 시도. 실패 시 PATH 환경변수로 ezdxf의 odafc가 자동 검색함.
         try:
             ezdxf.options.odafc_win_exec_path = found_path
         except AttributeError:
-            if not ezdxf.options.has_section('odafc'):
-                ezdxf.options._config.add_section('odafc')
-            ezdxf.options.set('odafc', 'win_exec_path', found_path)
+            try:
+                ezdxf.options.set('odafc', 'win_exec_path', found_path)
+            except Exception:
+                pass
     return found_path
 
 # ============================================================================
@@ -98,7 +100,7 @@ def _oda_환경_설정() -> str:
 _도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[\s\-_~–—−]+\d{1,5}(?![가-힣㎡,]))*[A-Za-z]*|TOE)(?!\d|[A-Za-z]|[가-힣])")
 _축척_패턴 = re.compile(r"(1\s?[/:,]\s?([\d,]+)|NONE|N/A)", re.I)
 _뷰_축척_타입_패턴 = re.compile(r'\b(A[13])\s*[-=:]\s*(1\s*/\s*[\d,]+|\d{2,5})', re.I)
-_동_패턴 = re.compile(r"^([0-9A-Za-z]+동)")
+_동_패턴 = re.compile(r"^([0-9A-Za-z]+동|[가-힣]{1,3}동)(?=\s|$)")
 
 GLOBAL_IGNORE_HEADERS = [
     "SUBJECT TITLE", "SUBJECT", "PROJECT TITLE", "PROJECT",
@@ -308,6 +310,22 @@ def _cad_로드(path: Path):
     _oda_환경_설정()
     from ezdxf.addons import odafc
     return odafc.readfile(str(path))
+
+def _find_도곽_blocks(layout, target_block: str) -> list:
+    """도곽 INSERT 검색. 정확 일치(공백/대소문자 무시) 우선, 없으면 부분일치 fallback."""
+    target = target_block.strip().lower()
+    if not target:
+        return []
+    all_inserts = list(layout.query("INSERT"))
+    exact = [ins for ins in all_inserts if ins.dxf.name.strip().lower() == target]
+    if exact:
+        return exact
+    partial = [ins for ins in all_inserts if target in ins.dxf.name.lower()]
+    if partial:
+        matched_names = sorted({ins.dxf.name for ins in partial})
+        logger.warning("[경고] '%s' 정확히 일치하는 도곽 없음 → 부분일치로 사용: %s",
+                       target_block, ", ".join(matched_names))
+    return partial
 
 def _get_safe_point(ent) -> Tuple[float, float]:
     p = ent.dxf.insert
@@ -716,15 +734,17 @@ def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], head
 # ============================================================================
 def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> pd.DataFrame:
     logger.info("[LIST] DWG 도면목록표 분석 시작: %s", os.path.basename(dwg_path))
-    데이터, 목표블록 = [], block_name.strip().lower()
+    데이터 = []
     list_rois = roi_cfg.get('list_rois', [])
     global_ignores_stripped = [h.replace(" ", "").upper() for h in GLOBAL_IGNORE_HEADERS]
-    
+    도곽_발견_레이아웃 = 0
+
     try:
         doc = _cad_로드(Path(dwg_path))
         for layout in doc.layouts:
-            도곽들 = [ins for ins in layout.query("INSERT") if 목표블록 in ins.dxf.name.lower()]
+            도곽들 = _find_도곽_blocks(layout, block_name)
             if not 도곽들: continue
+            도곽_발견_레이아웃 += 1
             레이아웃_원본텍스트 = _collect_layout_texts(layout)
             for 도곽 in 도곽들:
                 ix, iy = float(도곽.dxf.insert.x), float(도곽.dxf.insert.y)
@@ -859,9 +879,19 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
                             current_group = prop_group
                         a1, a3 = _extract_scale_smart(all_texts, header_a1_x, header_a3_x, is_list_table=True)
                         데이터.append({"도면번호(LIST)": 번호, "구분_LIST(그룹)": current_group, "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
-    except Exception as e: logger.error("목록표 분석 중 오류: %s", e)
+    except Exception:
+        logger.exception("목록표 분석 중 오류")
+    if 도곽_발견_레이아웃 == 0:
+        logger.warning("[경고] 도면목록표에서 '%s' 도곽 블록을 찾지 못했습니다. 블록 이름과 ROI 설정을 확인하세요.", block_name)
     df = pd.DataFrame(데이터)
-    return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(그룹)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"]) if df.empty else df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
+    if df.empty:
+        logger.warning("[경고] 도면목록표 추출 결과가 0건입니다. ROI(단 박스) 범위를 다시 확인해 주세요.")
+        return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(그룹)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"])
+    before = len(df)
+    df = df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
+    if before != len(df):
+        logger.warning("[경고] 도면목록표에 도면번호 중복 행 %d개 발견 → 첫 행만 채택했습니다.", before - len(df))
+    return df
 
 def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[float, float, str, float]]]) -> Tuple[List[dict], List[dict], str]:
     전체경로, 목표블록, roi_cfg, base_w, base_h, xref_texts = args
@@ -871,8 +901,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
     try:
         doc = _cad_로드(Path(전체경로)); 도곽_발견됨 = False
         for layout in doc.layouts:
-            # [핵심] 사용자가 지정한 개별도면용 '목표블록' 이름(Slave)으로 찾습니다.
-            도곽들 = [ins for ins in layout.query("INSERT") if 목표블록 in ins.dxf.name.lower()]
+            도곽들 = _find_도곽_blocks(layout, 목표블록)
             if not 도곽들: continue
             도곽_발견됨 = True; 레이아웃_원본텍스트 = _collect_layout_texts(layout)
             for 도곽 in 도곽들:
@@ -953,10 +982,11 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                             뷰심볼.append(sym)
         del doc
         if not 도곽_발견됨: return 데이터, 뷰심볼, "도곽 블록 없음"
-    except Exception as e: 에러메시지 = str(e)
+    except Exception as e:
+        에러메시지 = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
     return 데이터, 뷰심볼, 에러메시지
 
-def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]], progress_cb=None, cancel_event: Optional[threading.Event] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     모든_캐드파일 = []
     for d in target_dirs:
         폴더 = Path(d)
@@ -967,19 +997,46 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str,
     if not 캐드파일들:
         logger.warning("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return _빈_dwg, _빈_뷰
 
-    logger.info("[CAD ] 총 %d개의 개별 도면 분석 중... (터보 모드 가동 🚀)", len(캐드파일들))
+    총개수 = len(캐드파일들)
+    logger.info("[CAD ] 총 %d개의 개별 도면 분석 중... (터보 모드 가동 🚀)", 총개수)
+    if progress_cb:
+        try: progress_cb(0, 총개수)
+        except Exception: pass
+
     최종_데이터, 최종_뷰심볼 = [], []
+    취소됨 = False
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {executor.submit(_process_single_dwg, (path, slave_block_name.strip().lower(), roi_cfg, base_w, base_h, xref_texts)): path for path in 캐드파일들}
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            if cancel_event is not None and cancel_event.is_set():
+                logger.warning("[취소] 사용자 요청으로 잔여 작업을 중단합니다. (완료 %d / 전체 %d)", i - 1, 총개수)
+                for f in futures: f.cancel()
+                try:
+                    executor.shutdown(cancel_futures=True, wait=False)
+                except TypeError:
+                    executor.shutdown(wait=False)  # Python 3.8 이하 호환
+                취소됨 = True
+                break
             경로 = futures[future]
             try:
                 결과, 뷰심볼, 에러 = future.result()
                 if 결과: 최종_데이터.extend(결과)
                 if 뷰심볼: 최종_뷰심볼.extend(뷰심볼)
-                logger.info("   [%d/%d] %s: %s (%s)", i, len(캐드파일들), '완료' if 결과 else '패스', os.path.basename(경로), 에러 if 에러 else '성공')
-            except Exception as e: logger.error("   [%d/%d] 시스템 오류: %s (%s)", i, len(캐드파일들), os.path.basename(경로), e)
+                # 에러 메시지에 traceback이 포함되어 있을 수 있으므로 한 줄로 축약하여 표시
+                에러_요약 = 에러.splitlines()[0] if 에러 else "성공"
+                logger.info("   [%d/%d] %s: %s (%s)", i, 총개수, '완료' if 결과 else '패스', os.path.basename(경로), 에러_요약)
+                if 에러 and "\n" in 에러:
+                    logger.debug("   ↳ 상세 trace:\n%s", 에러)
+            except Exception:
+                logger.exception("   [%d/%d] 시스템 오류: %s", i, 총개수, os.path.basename(경로))
+            if progress_cb:
+                try: progress_cb(i, 총개수)
+                except Exception: pass
 
+    if 취소됨:
+        logger.warning("[취소] 완료된 %d개의 데이터까지만 리포트에 반영됩니다.", len(최종_데이터))
+    elif not 최종_데이터:
+        logger.warning("[경고] 개별 도면에서 추출된 데이터가 0건입니다. 도곽 블록 이름과 ROI 설정을 확인하세요.")
     dwg_df = pd.DataFrame(최종_데이터) if 최종_데이터 else _빈_dwg
     view_df = pd.DataFrame(최종_뷰심볼) if 최종_뷰심볼 else _빈_뷰
     return dwg_df, view_df
@@ -1146,17 +1203,26 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, vie
 # 3. [GUI 구축] CustomTkinter + TkinterDnD (드래그 앤 드롭 지원)
 # ============================================================================
 class GUILogHandler(logging.Handler):
-    """로그 레코드를 GUI 텍스트박스에 출력하는 핸들러."""
+    """로그 레코드를 GUI 텍스트박스에 출력하는 핸들러. Tkinter는 메인 스레드 외부 위젯 호출이 안전하지 않으므로 after()로 마샬링한다."""
     def __init__(self, textbox: ctk.CTkTextbox):
         super().__init__()
         self.textbox = textbox
 
+    def _append(self, msg: str):
+        try:
+            self.textbox.configure(state="normal")
+            self.textbox.insert("end", msg + "\n")
+            self.textbox.see("end")
+            self.textbox.configure(state="disabled")
+        except Exception:
+            pass  # 위젯이 이미 파괴된 경우 등
+
     def emit(self, record: logging.LogRecord):
-        msg = self.format(record)
-        self.textbox.configure(state="normal")
-        self.textbox.insert("end", msg + "\n")
-        self.textbox.see("end")
-        self.textbox.configure(state="disabled")
+        try:
+            msg = self.format(record)
+            self.textbox.after(0, self._append, msg)
+        except Exception:
+            pass
 
 # [핵심] ctk.CTk와 TkinterDnD.DnDWrapper를 결합하여 D&D 윈도우 생성
 class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
@@ -1171,6 +1237,7 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.xref_path = ""
         self.list_path = ""
         self.dwg_folders = []
+        self.cancel_event = threading.Event()
 
         self._build_ui()
 
@@ -1256,6 +1323,18 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
                                               placeholder_text="파일 선택 시 자동 입력됨")
         self.entry_block_name.pack(side="left")
 
+        # [V6.9] 카드 ①에 통합 — 개별도면 도곽 이름이 다른 경우 (협력업체 도곽 등 흔한 케이스)
+        self.check_diff_name = ctk.CTkCheckBox(
+            b1, text="개별 도면의 도곽 이름이 다른 경우 체크",
+            font=F_BODY, command=self.toggle_diff_name)
+        self.check_diff_name.pack(anchor="w", pady=(6, 2))
+        self.frame_diff = ctk.CTkFrame(b1, fg_color="transparent")
+        ctk.CTkLabel(self.frame_diff, text="↳  개별도면 도곽 이름 :",
+                     font=F_H2, text_color=DANGER).pack(side="left", padx=(20, 10))
+        self.entry_slave_block = ctk.CTkEntry(self.frame_diff, font=F_BODY, width=230, height=28,
+                                               placeholder_text="예: XR-form")
+        self.entry_slave_block.pack(side="left")
+
         c2, b2 = _card("②  도면목록표  DWG")
         c2.drop_target_register(DND_FILES)
         c2.dnd_bind("<<Drop>>", self.drop_list)
@@ -1280,29 +1359,24 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.textbox_folders.drop_target_register(DND_FILES)
         self.textbox_folders.dnd_bind("<<Drop>>", self.drop_folders)
 
-        _, b4 = _card("④  고급 옵션")
-        self.check_diff_name = ctk.CTkCheckBox(
-            b4, text="개별 도면의 도곽 이름이 도면목록표와 다를 경우 체크",
-            font=F_BODY, command=self.toggle_diff_name)
-        self.check_diff_name.pack(anchor="w", pady=2)
-        self.frame_diff = ctk.CTkFrame(b4, fg_color="transparent")
-        ctk.CTkLabel(self.frame_diff, text="↳  개별도면 도곽 이름 :",
-                     font=F_H2, text_color=DANGER).pack(side="left", padx=(20, 10))
-        self.entry_slave_block = ctk.CTkEntry(self.frame_diff, font=F_BODY, width=230, height=28,
-                                               placeholder_text="예: XR-form")
-        self.entry_slave_block.pack(side="left")
-
-        wrap = ctk.CTkFrame(page, fg_color="transparent")
-        wrap.pack(fill="x", padx=16, pady=(8, 0))
-        self.btn_start = ctk.CTkButton(wrap, text="검토 시작  →",
+        self.btn_wrap = ctk.CTkFrame(page, fg_color="transparent")
+        self.btn_wrap.pack(fill="x", padx=16, pady=(8, 0))
+        self.btn_start = ctk.CTkButton(self.btn_wrap, text="검토 시작  →",
                                         font=F_BTN, height=46, corner_radius=8,
                                         fg_color=PRIMARY, hover_color="#174da8",
                                         command=self.start_process)
         self.btn_start.pack(fill="x")
+        self.btn_cancel = ctk.CTkButton(self.btn_wrap, text="⏹  취소",
+                                         font=F_BTN, height=46, corner_radius=8,
+                                         fg_color=DANGER, hover_color="#b5362c",
+                                         command=self.cancel_process)
+        # self.btn_cancel은 처리 중에만 pack됨
 
-        self.progressbar = ctk.CTkProgressBar(page, mode="indeterminate", height=5,
+        self.progressbar = ctk.CTkProgressBar(page, mode="determinate", height=8,
                                                fg_color="#dde4ef", progress_color=PRIMARY,
                                                corner_radius=2)
+        self.progressbar.set(0)
+        self.lbl_progress = ctk.CTkLabel(page, text="", font=F_SM, text_color=DIM)
 
         _, blog = _card("작업 로그")
         self.log_box = ctk.CTkTextbox(blog, height=200, font=F_MONO,
@@ -1376,6 +1450,30 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
             for i, f in enumerate(self.dwg_folders, 1): self.textbox_folders.insert("end", f"[{i}] {f}\n")
         self.textbox_folders.configure(state="disabled")
 
+    # ================= 진행률 / 취소 =================
+    def _on_progress(self, current: int, total: int):
+        """워커 스레드에서 호출되는 진행률 콜백. 메인 스레드로 마샬링."""
+        self.after(0, self._update_progress_ui, current, total)
+
+    def _update_progress_ui(self, current: int, total: int):
+        try:
+            if total > 0:
+                self.progressbar.set(current / total)
+                self.lbl_progress.configure(text=f"진행 {current} / {total}  ({current * 100 // total}%)")
+            else:
+                self.progressbar.set(0)
+                self.lbl_progress.configure(text="")
+        except Exception:
+            pass
+
+    def cancel_process(self):
+        self.cancel_event.set()
+        try:
+            self.btn_cancel.configure(state="disabled", text="⏳  취소 중...")
+        except Exception:
+            pass
+        logger.warning("[사용자] 취소 요청을 받았습니다. 진행 중인 파일까지 마무리됩니다.")
+
     # ================= 실행 로직 =================
     def start_process(self):
         master_blk = self.entry_block_name.get().strip()
@@ -1384,15 +1482,26 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         if not master_blk: messagebox.showwarning("입력 오류", "공통 도곽 블록 이름을 입력하세요."); return
         if not self.list_path: messagebox.showwarning("입력 오류", "도면목록표 파일을 선택하세요."); return
         if not self.dwg_folders: messagebox.showwarning("입력 오류", "분석할 개별 도면 폴더를 하나 이상 추가하세요."); return
-        
+
         # [스마트 분기] 체크박스가 켜져 있다면, slave(개별도면) 블록 이름을 별도로 챙김
         if self.check_diff_name.get():
             slave_blk = self.entry_slave_block.get().strip()
             if not slave_blk: messagebox.showwarning("입력 오류", "개별도면용 도곽 이름을 입력하세요."); return
 
-        self.btn_start.configure(state="disabled", text="분석 진행 중...  ⏳")
-        self.progressbar.pack(fill="x", padx=16, pady=(0, 2))
-        self.progressbar.start()
+        # 취소 이벤트 초기화
+        self.cancel_event.clear()
+
+        # 버튼 전환: 시작 → 취소
+        self.btn_start.pack_forget()
+        self.btn_cancel.configure(state="normal", text="⏹  취소")
+        self.btn_cancel.pack(fill="x")
+
+        # 진행률 막대 + 라벨 표시 (결정형)
+        self.progressbar.set(0)
+        self.progressbar.pack(fill="x", padx=16, pady=(6, 0))
+        self.lbl_progress.configure(text="준비 중...")
+        self.lbl_progress.pack(padx=16, pady=(2, 0))
+
         thread = threading.Thread(target=self.run_core_logic, args=(master_blk, slave_blk), daemon=True)
         thread.start()
 
@@ -1419,38 +1528,75 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
             # 2. 목록표 스캔 (Master 블록 이름 사용)
             list_데이터 = extract_dwg_list_table(self.list_path, master_blk, roi_config, base_w, base_h, xref_texts)
+            if self.cancel_event.is_set():
+                logger.warning("[취소] 목록표 분석 직후 사용자 취소. 리포트 생성을 건너뜁니다.")
+                return
 
             # 3. 개별도면 스캔 (Slave 블록 이름 사용 - 같으면 Master 이름)
             if master_blk != slave_blk: logger.info("💡 [스마트 탐색 모드] 개별도면은 '%s' 도곽 이름으로 탐색을 시작합니다.", slave_blk)
-            dwg_데이터, 뷰심볼_데이터 = extract_dwg_data_multiprocess(self.dwg_folders, slave_blk, roi_config, base_w, base_h, xref_texts)
+            dwg_데이터, 뷰심볼_데이터 = extract_dwg_data_multiprocess(
+                self.dwg_folders, slave_blk, roi_config, base_w, base_h, xref_texts,
+                progress_cb=self._on_progress, cancel_event=self.cancel_event)
 
             # 4. 리포트 생성
             build_report(list_데이터, dwg_데이터, 최종_저장경로, view_df=뷰심볼_데이터)
 
             logger.info("-" * 72)
-            logger.info("[DONE] 검토 완료! 리포트가 프로그램과 같은 폴더에 저장되었습니다.")
+            if self.cancel_event.is_set():
+                logger.warning("[DONE] 사용자 취소 — 일부 데이터만 반영된 리포트가 저장되었습니다.")
+            else:
+                logger.info("[DONE] 검토 완료! 리포트가 프로그램과 같은 폴더에 저장되었습니다.")
             os.startfile(실행폴더)
 
         except PermissionError: logger.error("[ERROR] 엑셀 파일이 이미 켜져 있습니다. 창을 닫고 다시 실행해 주세요.")
         except Exception as e: logger.error("[ERROR] 시스템 오류 발생: %s", e)
         finally:
             def _finish():
+                # 버튼 전환: 취소 → 시작
+                self.btn_cancel.pack_forget()
+                self.btn_cancel.configure(state="normal", text="⏹  취소")
                 self.btn_start.configure(state="normal", text="검토 시작  →")
-                self.progressbar.stop()
+                self.btn_start.pack(fill="x")
+                # 진행률 막대 정리
+                self.progressbar.set(0)
                 self.progressbar.pack_forget()
+                self.lbl_progress.configure(text="")
+                self.lbl_progress.pack_forget()
             self.after(0, _finish)
 
 # ============================================================================
 # 메인 실행
 # ============================================================================
+def _ensure_oda_installed() -> bool:
+    """ODA 미설치 시 다운로드 → 사용자 설치 → 재검색 루프. 성공하면 True, 사용자가 취소하면 False."""
+    while not _oda_환경_설정():
+        root = tk.Tk(); root.withdraw()
+        retry = messagebox.askretrycancel(
+            "엔진 설치 안내",
+            "⚠️ CAD 분석 엔진(ODA File Converter)이 설치되어 있지 않습니다.\n\n"
+            "[다시 시도] → 다운로드 페이지를 열고, 설치 후 확인 시 자동 재검색\n"
+            "[취소] → 프로그램 종료"
+        )
+        if not retry:
+            root.destroy()
+            return False
+        webbrowser.open(ODA_DOWNLOAD_URL)
+        proceed = messagebox.askokcancel(
+            "설치 완료 확인",
+            "ODA File Converter 설치가 끝나면 [확인]을 눌러주세요.\n"
+            "기본 경로(C:\\Program Files\\ODA)에 설치되었어야 합니다.\n\n"
+            "[취소] → 프로그램 종료"
+        )
+        root.destroy()
+        if not proceed:
+            return False
+    return True
+
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
-    
-    if not _oda_환경_설정():
-        root = tk.Tk(); root.withdraw()
-        msg = "⚠️ CAD 분석 엔진(ODA)이 설치되어 있지 않습니다!\n\n확인을 누르면 다운로드 페이지가 열립니다."
-        if messagebox.askokcancel("엔진 설치 안내", msg): webbrowser.open(ODA_DOWNLOAD_URL)
+
+    if not _ensure_oda_installed():
         sys.exit()
 
     app = AutoDWGApp()
