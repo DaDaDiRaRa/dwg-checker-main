@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Generated outputs
+report.xlsx
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# eeee
+venv/
+__pycache__/
+*.pdf
+*.dwg
+.vscode/

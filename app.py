@@ -1,0 +1,1603 @@
+"""
+Copyright (c) 2026 건원건축 김정현. All rights reserved.
+
+본 프로그램은 도면 검토 업무 효율화를 위해 기획 및 개발되었습니다.
+외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
+
+
+app.py  —  DWG 자동 검토기 v_1.7 Ultimate Edition (Kunwon Masterpiece)
+========================================================================
+[V6.7 업데이트]
+1. Drag & Drop 완벽 지원: 윈도우 탐색기에서 파일(.dwg)이나 폴더를 마우스로 끌어서
+   프로그램 창에 던지면(Drop) 경로가 자동으로 인식되고 세팅됩니다.
+2. 스마트 숨김형 UI (Progressive Disclosure): 평소에는 심플하게 1개의 도곽 이름만 받지만,
+   체크박스를 켜면 [목록표(Master) / 개별도면(Slave)] 도곽 이름을 분리해서 탐색합니다.
+   (박스 좌표는 무조건 Master 기준, 개별도면 탐색은 Slave 이름 기준으로 작동)
+3. 무한 체인 정규식 (V6.6 로직 유지): AA-000-000-000 무제한 추출 완벽 적용.
+========================================================================
+"""
+
+from __future__ import annotations
+import glob, os, re, sys, webbrowser, json, math, logging, traceback
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import threading
+import concurrent.futures
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import pandas as pd
+import ezdxf
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+import customtkinter as ctk
+from tkinterdnd2 import TkinterDnD, DND_FILES  # [V6.7 추가] 드래그 앤 드롭 엔진
+
+# ============================================================================
+# [UI 테마 설정]
+# ============================================================================
+ctk.set_appearance_mode("Light")
+ctk.set_default_color_theme("blue")
+
+# ============================================================================
+# [로깅 설정] GUI 핸들러는 앱 초기화 시 추가, 파일 핸들러는 즉시 활성화
+# ============================================================================
+logger = logging.getLogger("AutoDWG")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.NullHandler())
+
+def _setup_file_logger():
+    log_dir = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'AutoDWG_Checker')
+    os.makedirs(log_dir, exist_ok=True)
+    fh = logging.FileHandler(os.path.join(log_dir, 'autodwg.log'), encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-8s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
+
+_setup_file_logger()
+
+리포트_이름: str = "도면검토리포트_최종.xlsx"
+ODA_DOWNLOAD_URL = "https://www.opendesign.com/guestfiles/oda_file_converter"
+
+# ============================================================================
+# 0. 기존 코어 엔진 (JSON 로드 및 ODA)
+# ============================================================================
+def load_roi_config(block_name: str) -> Optional[dict]:
+    config_dir = os.path.join(os.environ.get('APPDATA', ''), 'AutoDWG_Checker')
+    config_path = os.path.join(config_dir, f"{block_name}.json")
+    if os.path.exists(config_path):
+        for enc in ['cp949', 'utf-8', 'euc-kr']:
+            try:
+                with open(config_path, 'r', encoding=enc) as f:
+                    return json.load(f)
+            except Exception: continue
+    return None
+
+def _oda_환경_설정() -> str:
+    found_path = ""
+    for 경로 in [r"C:\Program Files\ODA", r"C:\Program Files (x86)\ODA"]:
+        실행파일들 = glob.glob(os.path.join(경로, "**", "ODAFileConverter.exe"), recursive=True)
+        if 실행파일들:
+            found_path = sorted(실행파일들, reverse=True)[0]
+            break
+    if found_path:
+        폴더경로 = os.path.dirname(found_path)
+        if 폴더경로 not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = 폴더경로 + os.pathsep + os.environ.get("PATH", "")
+        # 직접 속성 설정만 시도. 실패 시 PATH 환경변수로 ezdxf의 odafc가 자동 검색함.
+        try:
+            ezdxf.options.odafc_win_exec_path = found_path
+        except AttributeError:
+            try:
+                ezdxf.options.set('odafc', 'win_exec_path', found_path)
+            except Exception:
+                pass
+    return found_path
+
+# ============================================================================
+# 1. 공통 유틸리티 (무한체인 정규식 및 필터)
+# ============================================================================
+_도면번호_패턴 = re.compile(r"(?<![가-힣A-Za-z0-9])([A-Z\u0391-\u03A9\.가-힣][A-Z0-9\u0391-\u03A9\.가-힣]{0,4})[\s\-_~–—−]*(\d{1,5}(?:[\s\-_~–—−]+\d{1,5}(?![가-힣㎡,]))*[A-Za-z]*|TOE)(?!\d|[A-Za-z]|[가-힣])")
+_축척_패턴 = re.compile(r"(1\s?[/:,]\s?([\d,]+)|NONE|N/A)", re.I)
+_뷰_축척_타입_패턴 = re.compile(r'\b(A[13])\s*[-=:]\s*(1\s*/\s*[\d,]+|\d{2,5})', re.I)
+_동_패턴 = re.compile(r"^([0-9A-Za-z]+동|[가-힣]{1,3}동)(?=\s|$)")
+
+GLOBAL_IGNORE_HEADERS = [
+    "SUBJECT TITLE", "SUBJECT", "PROJECT TITLE", "PROJECT",
+    "DRAWING TITLE", "DRAWING NO.", "DRAWING NO", "DWG.NO.", "DWG. NO.", "DWG.NO", "DWG NO.", "DWG NO", "TITLE",
+    "SHEET NO.", "SHEET NO", "SHT NO.", "SHT NO", "SHEET",
+    "도면번호", "도연번호", "일련번호", "연번", "NO", "NO.", "도면명", "도면명칭", "축척(A1)", "축척(A3)", "축척(A0)", 
+    "SCALE(A1)", "SCALE(A3)", "SCALE(A0)", "축척(1:)", "축척(1/)", "SCALE(1:)", "SCALE(1/)", "(1:)", "(1/)",
+    "축척", "축적", "SCALE", "비고", "REMARK", "REMARKS", "사업승인", "착공", "견적", "사용승인", "1:1"
+]
+CATEGORY_KEYWORDS = ["공통사항", "일반사항", "건축도면", "구조도면", "기계도면", "전기도면", "토목도면", "조경도면", "소방도면", "부분상세도"]
+
+def _clean_text_from_headers(txt: str) -> str:
+    clean = txt
+    for h in sorted(GLOBAL_IGNORE_HEADERS, key=len, reverse=True):
+        clean = re.compile(re.escape(h), re.IGNORECASE).sub(" ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return re.sub(r"^[-_,\s]+|[-_,\s]+$", "", clean)
+
+def _extract_dong_from_title(title: str) -> str:
+    m = _동_패턴.match(title.strip())
+    return m.group(1) if m else ""
+
+def _extract_group_from_title(title: str) -> str:
+    """동/그룹 정보 추출. 동을 먼저 제거한 후 남은 텍스트의 첫 토큰이 그룹인지 판단."""
+    title = title.strip()
+    # 동을 먼저 제거
+    m = _동_패턴.match(title)
+    if m:
+        title = title[len(m.group(1)):].strip()
+    if not title:
+        return ""
+    # 첫 토큰만 추출 (공백까지)
+    first_token = title.split(None, 1)[0]
+    # 도면명 특징: 숫자, 영문대문자, 특수문자 포함
+    # 그룹: 순수 한글만 있음
+    if re.search(r"\d|[A-Z]|[#\-_\(\)\[\]]", first_token):
+        return ""  # 도면명으로 시작 → 그룹 없음
+    if re.match(r"^[가-힣]+$", first_token):
+        return first_token  # 순수 한글 → 그룹
+    return ""
+
+def _도면번호_세척(raw_s: str) -> str:
+    if not raw_s: return ""
+    suffix_m = re.search(r"[a-z]+$", raw_s.strip())
+    orig_suffix = suffix_m.group(0) if suffix_m else ""
+    s = raw_s.strip().upper().replace("Λ", "A").replace("Δ", "A").replace("TOE", "108")
+    if s.startswith("."): s = "AA" + s[1:]
+    s = re.sub(r"\s*([-_~])\s*", r"\1", s)
+    s = re.sub(r"[-_~]{2,}", "-", re.sub(r"\s+", " ", s))
+    # CAD에서 한 글자씩 분리 저장된 경우 합치기 (예: "AA-0 0 0-0 0 0-0" -> "AA-000-000-0")
+    segs = re.split(r"([-_~])", s)
+    merged = []
+    for i, seg in enumerate(segs):
+        if i % 2 == 1:
+            merged.append(seg)
+        else:
+            parts = [t for t in seg.split(" ") if t]
+            if parts and all(len(t) == 1 for t in parts):
+                merged.append("".join(parts))
+            elif parts:
+                buf, rp = [], []
+                for p in parts:
+                    if len(p) == 1: buf.append(p)
+                    else:
+                        if buf: rp.append("".join(buf)); buf = []
+                        rp.append(p)
+                if buf: rp.append("".join(buf))
+                merged.append(" ".join(rp))
+            else:
+                merged.append(seg)
+    s = "".join(merged)
+    # 남은 공백은 그래픽 대시가 텍스트로 저장되지 않은 자리 -> 대시로 교체
+    s = re.sub(r"(?<=[A-Za-z0-9]) (?=[A-Za-z0-9])", "-", s)
+    if orig_suffix: s = s[:-len(orig_suffix)] + orig_suffix
+    return s
+
+def _spatial_reconstruct_num_str(texts: list) -> str:
+    """Join number-column text entities; insert '-' where spatial gap between
+    consecutive single-char alphanumeric tokens indicates a missing graphical dash."""
+    if not texts: return ""
+    single_char_gaps = []
+    for i in range(1, len(texts)):
+        tx, _, txt_i, _ = texts[i]
+        px, _, ptxt_i, _ = texts[i-1]
+        s, ps = txt_i.strip(), ptxt_i.strip()
+        if (len(s) == 1 and len(ps) == 1
+                and re.match(r"[0-9A-Za-z]", s)
+                and re.match(r"[0-9A-Za-z]", ps)):
+            single_char_gaps.append(tx - px)
+    if len(single_char_gaps) >= 2:
+        sorted_gaps = sorted(single_char_gaps)
+        median_gap = sorted_gaps[len(sorted_gaps) // 2]
+        gap_threshold = median_gap * 1.6
+    elif single_char_gaps:
+        avg_h = sum(t[3] for t in texts) / len(texts)
+        gap_threshold = avg_h * 0.85
+    else:
+        gap_threshold = None
+    tokens = []
+    for i, t in enumerate(texts):
+        tx, ty, txt_i, th = t
+        stripped = txt_i.strip()
+        if not stripped:
+            continue
+        if i > 0 and gap_threshold is not None:
+            prev_tx, _, prev_txt_i, _ = texts[i-1]
+            ps = prev_txt_i.strip()
+            if (len(ps) == 1 and len(stripped) == 1
+                    and re.match(r"[0-9A-Za-z]", ps)
+                    and re.match(r"[0-9A-Za-z]", stripped)
+                    and (tx - prev_tx) > gap_threshold):
+                tokens.append("-")
+        tokens.append(stripped)
+    return " ".join(tokens)
+
+def _merge_title_char_runs(s: str) -> str:
+    """Merge space-separated single-char tokens in title strings (char-by-char CAD storage)."""
+    if not s: return ""
+    result_parts = []
+    run = []
+    for tok in s.split(" "):
+        if tok and len(tok) == 1:
+            run.append(tok)
+        else:
+            if run:
+                merged = "".join(run)
+                # Attach separator-leading runs directly to previous word (e.g. "-12" -> "근거-12")
+                if result_parts and (merged[0] in "-_~" or result_parts[-1][-1:] in "-_~"):
+                    result_parts[-1] += merged
+                else:
+                    result_parts.append(merged)
+                run = []
+            if tok:
+                result_parts.append(tok)
+    if run:
+        merged = "".join(run)
+        if result_parts and (merged[0] in "-_~" or result_parts[-1][-1:] in "-_~"):
+            result_parts[-1] += merged
+        else:
+            result_parts.append(merged)
+    return " ".join(result_parts)
+
+def _축척_텍스트_정리(txt: str) -> str:
+    if not txt: return "X"
+    u = txt.strip().upper()
+    if "NONE" in u or "N/A" in u: return "NONE"
+    m = _축척_패턴.search(u)
+    if m and m.group(2):
+        return f"1/{m.group(2).replace(',', '')}"
+    # "A3:100" 처럼 분자 없이 분모만 있는 경우 (예: "100" → "1/100")
+    plain = re.sub(r'[,\s]', '', u)
+    if re.match(r'^\d+$', plain):
+        return f"1/{plain}"
+    return "X"
+
+def _extract_drawing_number(text: str) -> Optional[str]:
+    for m in _도면번호_패턴.finditer(text):
+        prefix = m.group(1)
+        if m.group(0) in ["A1", "A3", "A0", "A2", "A4"]: continue
+        exclude_words = ["상세", "일람", "배치", "전개", "마감", "계획", "조감", "구조", "코어", "지하", "옥상", "옥탑", "지붕", "주동", "단위", "세대", "내역", "관계", "형별", "부분", "창호", "가구", "조경", "토목", "기계", "전기", "범례", "개요", "표지", "도면", "시설", "센터", "주차장", "휴게소", "사무소", "경로당", "어린이집", "유치원", "도서관", "커뮤니티", "피트니스", "사우나", "골프", "문주", "경비실"]
+        if any(k in prefix for k in exclude_words): continue
+        if prefix.endswith("도") or prefix.endswith("표") or prefix.endswith("층") or prefix.endswith("동"): continue
+        if len(prefix) > 1 and all("가" <= c <= "힣" for c in prefix): continue
+        result = m.group(0)
+        # 번호 ROI에 혼입된 노이즈 제거: 숫자 뒤 " N" (공백+단일숫자) trailing
+        # 예) "AA-1743 0" → "AA-1743"  / 한글자씩 "1 7 4 3 0" → 영향 없음
+        result = re.sub(r'(?<=\d) [0-9]$', '', result)
+        return result if result else None
+    return None
+
+def _정리문자열(txt: str) -> str:
+    return re.sub(r"\s+", " ", (txt or "")).strip()
+
+def _expand_title_keywords(title: str) -> set:
+    """도면명에서 키워드 집합을 추출. 쉼표 축약형을 확장한다.
+    예) '입,단면도' → {'입면도','단면도'} / '지상1층,지상2층' → {'지상1층','지상2층'}"""
+    result = set()
+    for word in title.strip().split():
+        if ',' not in word:
+            if word:
+                result.add(word)
+            continue
+        parts = word.split(',')
+        last = parts[-1]
+        for part in parts[:-1]:
+            # 앞 조각이 마지막 조각보다 짧으면 마지막의 뒷부분(접미사)을 붙여 완성
+            result.add(part + last[len(part):] if len(part) < len(last) else part)
+        result.add(last)
+    return {w for w in result if w}
+
+def _title_contains_view(block_title: str, view_title: str) -> bool:
+    """뷰 심볼 도면명의 단어들이 도곽 도면명 안에 모두 포함되는지 확인.
+    뷰 도면명 끝의 번호 접미사(예: '-1', '-2')는 비교 전에 제거한다."""
+    if not view_title or not block_title:
+        return False
+    for bad in ('nan', 'x', 'none', ''):
+        if view_title.lower().strip() == bad or block_title.lower().strip() == bad:
+            return False
+    # 뷰 도면명 끝 번호 제거: "입면도-1" → "입면도", "단면도 2" → "단면도"
+    view_stripped = re.sub(r'[\s\-_]+\d+\s*$', '', view_title.strip())
+    block_words = _expand_title_keywords(block_title)
+    view_words  = _expand_title_keywords(view_stripped)
+    return bool(view_words) and view_words.issubset(block_words)
+
+def _cad_로드(path: Path):
+    if path.suffix.lower() == ".dxf": return ezdxf.readfile(str(path))
+    _oda_환경_설정()
+    from ezdxf.addons import odafc
+    return odafc.readfile(str(path))
+
+def _find_도곽_blocks(layout, target_block: str) -> list:
+    """도곽 INSERT 검색. 정확 일치(공백/대소문자 무시) 우선, 없으면 부분일치 fallback."""
+    target = target_block.strip().lower()
+    if not target:
+        return []
+    all_inserts = list(layout.query("INSERT"))
+    exact = [ins for ins in all_inserts if ins.dxf.name.strip().lower() == target]
+    if exact:
+        return exact
+    partial = [ins for ins in all_inserts if target in ins.dxf.name.lower()]
+    if partial:
+        matched_names = sorted({ins.dxf.name for ins in partial})
+        logger.warning("[경고] '%s' 정확히 일치하는 도곽 없음 → 부분일치로 사용: %s",
+                       target_block, ", ".join(matched_names))
+    return partial
+
+def _get_safe_point(ent) -> Tuple[float, float]:
+    p = ent.dxf.insert
+    if getattr(ent.dxf, "halign", 0) > 0 or getattr(ent.dxf, "valign", 0) > 0:
+        ap = getattr(ent.dxf, "align_point", None)
+        if ap and (round(ap[0], 2) != 0 or round(ap[1], 2) != 0): p = ap
+    return float(p[0]), float(p[1])
+
+def _텍스트_데이터_추출(ent) -> List[Tuple[float, float, str, float]]:
+    유형 = ent.dxftype(); 결과 = []
+    try:
+        if 유형 in ["TEXT", "ATTRIB"]:
+            px, py = _get_safe_point(ent)
+            txt = (ent.dxf.text or "").strip()
+            if txt: 결과.append((px, py, txt, float(getattr(ent.dxf, "height", 10.0))))
+        elif 유형 == "MTEXT":
+            h = getattr(ent.dxf, "char_height", 10.0)
+            bx, by = float(ent.dxf.insert[0]), float(ent.dxf.insert[1])
+            for i, line in enumerate(ent.plain_text().split('\n')):
+                txt = line.strip()
+                if txt: 결과.append((bx, by - (i * h * 1.5), txt, float(h)))
+        elif 유형 == "ATTDEF":
+            px, py = _get_safe_point(ent)
+            txt = getattr(ent.dxf, 'tag', '').strip() 
+            if not txt: txt = getattr(ent.dxf, 'text', '').strip() 
+            if txt: 결과.append((px, py, txt, float(getattr(ent.dxf, "height", 10.0))))
+    except Exception as e: logger.debug("텍스트 엔티티 처리 건너뜀: %s", e)
+    return 결과
+
+def _collect_layout_texts(layout) -> List[Tuple[float, float, str, float]]:
+    texts = []
+    try:
+        for ent in layout.query("TEXT MTEXT LINE LWPOLYLINE INSERT ATTDEF"):
+            if ent.dxftype() in ["TEXT", "MTEXT", "LINE", "LWPOLYLINE", "ATTDEF"]:
+                texts.extend(_텍스트_데이터_추출(ent))
+            elif ent.dxftype() == "INSERT":
+                for att in getattr(ent, "attribs", []): texts.extend(_텍스트_데이터_추출(att))
+                try:
+                    for v_ent in ent.virtual_entities():
+                        if v_ent.dxftype() in ["TEXT", "MTEXT", "LINE", "LWPOLYLINE", "ATTDEF"]: texts.extend(_텍스트_데이터_추출(v_ent))
+                        elif v_ent.dxftype() == "INSERT":
+                            for v_att in getattr(v_ent, "attribs", []): texts.extend(_텍스트_데이터_추출(v_att))
+                except Exception as e: logger.debug("가상 엔티티 처리 건너뜀: %s", e)
+    except Exception as e: logger.debug("레이아웃 텍스트 수집 건너뜀: %s", e)
+    seen, out = set(), []
+    for x, y, txt, h in texts:
+        clean = _정리문자열(txt); key = (round(x, 2), round(y, 2), clean)
+        if key not in seen: seen.add(key); out.append((float(x), float(y), clean, float(h)))
+    return out
+
+def _parse_xref_original(xref_path: str) -> List[Tuple[float, float, str, float]]:
+    logger.info("[XREF] 도곽 원본 스캔 중... (%s)", os.path.basename(xref_path))
+    try:
+        doc = _cad_로드(Path(xref_path)); texts = []
+        for ent in doc.modelspace().query("TEXT MTEXT INSERT ATTDEF"):
+            if ent.dxftype() in ["TEXT", "MTEXT", "ATTDEF"]: texts.extend(_텍스트_데이터_추출(ent))
+            elif ent.dxftype() == "INSERT":
+                for att in getattr(ent, "attribs", []): texts.extend(_텍스트_데이터_추출(att))
+                try:
+                    for v_ent in ent.virtual_entities():
+                        if v_ent.dxftype() in ["TEXT", "MTEXT", "ATTDEF"]: texts.extend(_텍스트_데이터_추출(v_ent))
+                except Exception as e: logger.debug("XREF 가상 엔티티 처리 건너뜀: %s", e)
+        seen, out = set(), []
+        for x, y, txt, h in texts:
+            clean = _정리문자열(txt); key = (round(x, 2), round(y, 2), clean)
+            if key not in seen: seen.add(key); out.append((float(x), float(y), clean, float(h)))
+        logger.info("  -> 엑스레이 스캔 성공! %d개의 고정 텍스트 암기 완료.", len(out))
+        return out
+    except Exception as e: logger.error("XREF 스캔 실패: %s", e); return []
+
+def _extract_view_symbols(layout, ix: float, iy: float, xscale: float, yscale: float,
+                           base_w: float, base_h: float, view_roi: list, rot_deg: float) -> List[dict]:
+    """view_symbol_roi 안의 원+선 제목 기호에서 뷰 도면명과 축척을 추출.
+
+    양식: 원의 중심을 수평 LINE이 관통하며 오른쪽으로 뻗고,
+          선 위 = 도면명(한글 포함), 선 아래 = 축척(S:A3=1/200 형식).
+    수평 LINE이 원을 통과하지 않는 원은 장식용으로 간주하여 무시한다.
+    """
+    rad = math.radians(-rot_deg)
+    cos_v, sin_v = math.cos(rad), math.sin(rad)
+
+    def _unrot(tx, ty):
+        dx, dy = tx - ix, ty - iy
+        return ix + dx * cos_v - dy * sin_v, iy + dx * sin_v + dy * cos_v
+
+    def _pt_seg_dist(px, py, sx, sy, ex, ey):
+        """점 (px,py)에서 선분까지의 최단 거리."""
+        dx, dy = ex - sx, ey - sy
+        len_sq = dx * dx + dy * dy
+        if len_sq == 0:
+            return math.hypot(px - sx, py - sy)
+        t = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / len_sq))
+        return math.hypot(px - (sx + t * dx), py - (sy + t * dy))
+
+    x_min = ix + base_w * xscale * view_roi[0]
+    x_max = ix + base_w * xscale * view_roi[1]
+    y_min = iy + base_h * yscale * view_roi[2]
+    y_max = iy + base_h * yscale * view_roi[3]
+
+    def _in_roi(tx, ty):
+        ux, uy = _unrot(float(tx), float(ty))
+        return x_min <= ux <= x_max and y_min <= uy <= y_max
+
+    # view_symbol_roi 박스 안의 TEXT/MTEXT만 수집
+    # (박스 밖 도곽 텍스트가 섞이지 않도록 ROI 경계를 엄격히 적용)
+    all_texts = []
+    for ent in layout.query("TEXT MTEXT"):
+        try:
+            tx2, ty2 = float(ent.dxf.insert.x), float(ent.dxf.insert.y)
+            if not _in_roi(tx2, ty2):
+                continue
+            txt2 = _정리문자열(ent.dxf.text if ent.dxftype() == "TEXT" else ent.plain_text())
+            if txt2:
+                all_texts.append((tx2, ty2, txt2))
+        except Exception:
+            pass
+
+    # INSERT 블록 내부 TEXT/MTEXT도 수집 (뷰심볼이 블록으로 정의된 경우)
+    # 변환 후 좌표가 ROI 안에 있는 것만 추가
+    try:
+        doc = layout.doc
+        for ins in layout.query("INSERT"):
+            try:
+                ip = ins.dxf.insert
+                ipx, ipy = float(ip.x), float(ip.y)
+                ixs = float(ins.dxf.get('xscale', 1.0) or 1.0)
+                iys = float(ins.dxf.get('yscale', 1.0) or 1.0)
+                ir  = math.radians(float(ins.dxf.get('rotation', 0.0) or 0.0))
+                ic, is_ = math.cos(ir), math.sin(ir)
+                blk = doc.blocks.get(ins.dxf.name)
+                if blk is None:
+                    continue
+                for sub in blk:
+                    if sub.dxftype() not in ("TEXT", "MTEXT"):
+                        continue
+                    try:
+                        lx = float(sub.dxf.insert.x) * ixs
+                        ly = float(sub.dxf.insert.y) * iys
+                        wx = ipx + lx * ic - ly * is_
+                        wy = ipy + lx * is_ + ly * ic
+                        if not _in_roi(wx, wy):
+                            continue
+                        stxt = _정리문자열(sub.dxf.text if sub.dxftype() == "TEXT" else sub.plain_text())
+                        if stxt:
+                            all_texts.append((wx, wy, stxt))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # LINE 엔티티 수집
+    all_lines = []
+    for ent in layout.query("LINE"):
+        try:
+            sx, sy = float(ent.dxf.start.x), float(ent.dxf.start.y)
+            ex, ey = float(ent.dxf.end.x), float(ent.dxf.end.y)
+            all_lines.append((sx, sy, ex, ey))
+        except Exception:
+            pass
+
+    symbols, seen = [], set()
+    for ent in layout.query("CIRCLE"):
+        try:
+            cx, cy = float(ent.dxf.center.x), float(ent.dxf.center.y)
+            r = float(ent.dxf.radius)
+        except Exception:
+            continue
+        if r <= 0:
+            continue
+        ucx, ucy = _unrot(cx, cy)
+        if not (x_min <= ucx <= x_max and y_min <= ucy <= y_max):
+            continue
+        key = (round(cx, 1), round(cy, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # 수평 LINE 탐색: 원 중심을 관통하며 오른쪽으로 '비대칭으로' 뻗은 선
+        # 뷰심볼: 왼쪽 연장 ≤ r 정도, 오른쪽 연장은 훨씬 길다
+        # 구조 십자선: 좌우 대칭 → 비율 검사로 제외
+        far_right_x = None
+        for sx, sy, ex, ey in all_lines:
+            dx_l, dy_l = ex - sx, ey - sy
+            length = math.hypot(dx_l, dy_l)
+            if length < r * 0.3:
+                continue
+            if abs(dy_l / length) > math.sin(math.radians(30)):
+                continue
+            if _pt_seg_dist(cx, cy, sx, sy, ex, ey) > r * 1.5:
+                continue
+            right_x = max(sx, ex)
+            left_x  = min(sx, ex)
+            right_ext = right_x - cx           # 오른쪽 연장 거리
+            left_ext  = max(0.0, cx - left_x)  # 왼쪽 연장 거리
+            # 오른쪽으로 최소 2r 이상 뻗어야 함
+            if right_ext < r * 2:
+                continue
+            # 뷰심볼 선은 왼쪽보다 오른쪽이 2배 이상 길어야 함 (구조 십자선 제외)
+            if left_ext > 0 and right_ext < left_ext * 2:
+                continue
+            if far_right_x is None or right_x > far_right_x:
+                far_right_x = right_x
+
+        if far_right_x is None:
+            continue  # 뷰심볼 형태의 선 없음 → 건너뜀
+
+        # 수평선이 원 중심을 통과하므로 line_y = cy
+        line_y = cy
+
+        # 도면명: view_roi 박스 안, line_y 위쪽, 한글 포함 → 원 중심으로부터 2D 거리 가장 가까운 것
+        # 수직 거리만 쓰면 같은 높이에 나란히 있는 뷰심볼들이 서로의 제목을 가로챔
+        title_cands = []
+        for tx, ty, txt in all_texts:
+            if ty <= line_y:
+                continue
+            if not re.search(r'[가-힣]', txt) or len(txt.replace(' ', '')) < 3:
+                continue
+            title_cands.append((math.hypot(tx - cx, ty - line_y), txt))
+        title_text = _정리문자열(min(title_cands, key=lambda t: t[0])[1]) if title_cands else ""
+
+        # 축척: view_roi 박스 안, line_y 아래쪽, 패턴 매칭 → 원 중심으로부터 2D 거리 가장 가까운 것
+        # finditer 사용: 한 텍스트에 "A1:1/600, A3:1/1200" 처럼 두 값이 함께 있어도 모두 추출
+        scale_cands = []
+        for tx, ty, txt in all_texts:
+            if ty >= line_y:
+                continue
+            for m in _뷰_축척_타입_패턴.finditer(txt):
+                scale_cands.append((math.hypot(tx - cx, line_y - ty), m.group(1).upper(), _축척_텍스트_정리(m.group(2))))
+        a1_cands = [(d, v) for d, t, v in scale_cands if t == "A1"]
+        a3_cands = [(d, v) for d, t, v in scale_cands if t == "A3"]
+        scale_a1 = min(a1_cands, key=lambda t: t[0])[1] if a1_cands else ""
+        scale_a3 = min(a3_cands, key=lambda t: t[0])[1] if a3_cands else ""
+
+        # 도면명과 축척 둘 다 있어야 유효한 뷰심볼 (하나만 있으면 오탐으로 간주)
+        if title_text and (scale_a1 or scale_a3):
+            symbols.append({'뷰_도면명': title_text, '뷰_A1축척': scale_a1, '뷰_A3축척': scale_a3,
+                            '_cx': round(cx, 1), '_cy': round(cy, 1)})
+
+    # ── ATTRIB 기반 뷰심볼 처리 ──────────────────────────────────────────────
+    # 뷰심볼이 INSERT 블록으로 정의되고 도면명/축척이 ATTRIB로 저장된 경우
+    # (TEXT/MTEXT 대신 고급속성편집기에서 수정하는 블록)
+    try:
+        _doc = layout.doc
+        for ins in layout.query("INSERT"):
+            try:
+                attrib_list = list(ins.attribs)
+                if not attrib_list:
+                    continue
+
+                ipx = float(ins.dxf.insert.x)
+                ipy = float(ins.dxf.insert.y)
+                uipx, uipy = _unrot(ipx, ipy)
+                if not (x_min <= uipx <= x_max and y_min <= uipy <= y_max):
+                    continue
+
+                # 블록 정의에 CIRCLE이 있어야 뷰심볼로 간주
+                _blk = _doc.blocks.get(ins.dxf.name)
+                if _blk is None:
+                    continue
+
+                ixs2 = float(ins.dxf.get('xscale', 1.0) or 1.0)
+                iys2 = float(ins.dxf.get('yscale', 1.0) or 1.0)
+                ir2  = math.radians(float(ins.dxf.get('rotation', 0.0) or 0.0))
+                ic2, is2 = math.cos(ir2), math.sin(ir2)
+
+                # 블록 정의에서 CIRCLE 좌표 찾기 (WCS 변환)
+                circle_wcy = None
+                for sub in _blk:
+                    if sub.dxftype() == "CIRCLE":
+                        lx2 = float(sub.dxf.center.x) * ixs2
+                        ly2 = float(sub.dxf.center.y) * iys2
+                        circle_wcy = ipy + lx2 * is2 + ly2 * ic2
+                        break
+                if circle_wcy is None:
+                    continue  # CIRCLE 없으면 뷰심볼 블록이 아님
+
+                line_y2 = circle_wcy
+                key = (round(ipx, 1), round(ipy, 1))
+                if key in seen:
+                    continue
+
+                # ATTRIB에서 도면명(위)/축척(아래) 추출
+                # ATTRIB 삽입점은 WCS 기준으로 저장됨
+                title_cands2, scale_cands2 = [], []
+                for attrib in attrib_list:
+                    try:
+                        aty = float(attrib.dxf.insert.y)
+                        atxt = _정리문자열(attrib.dxf.text)
+                        if not atxt:
+                            continue
+                        if aty > line_y2:
+                            if re.search(r'[가-힣]', atxt) and len(atxt.replace(' ', '')) >= 3:
+                                title_cands2.append((aty - line_y2, atxt))
+                        else:
+                            for m in _뷰_축척_타입_패턴.finditer(atxt):
+                                scale_cands2.append((line_y2 - aty, m.group(1).upper(), _축척_텍스트_정리(m.group(2))))
+                    except Exception:
+                        pass
+
+                title_text2 = _정리문자열(min(title_cands2, key=lambda t: t[0])[1]) if title_cands2 else ""
+                a1_cands2 = [(d, v) for d, t, v in scale_cands2 if t == "A1"]
+                a3_cands2 = [(d, v) for d, t, v in scale_cands2 if t == "A3"]
+                scale_a1_2 = min(a1_cands2, key=lambda t: t[0])[1] if a1_cands2 else ""
+                scale_a3_2 = min(a3_cands2, key=lambda t: t[0])[1] if a3_cands2 else ""
+
+                if title_text2 and (scale_a1_2 or scale_a3_2):
+                    seen.add(key)
+                    symbols.append({'뷰_도면명': title_text2, '뷰_A1축척': scale_a1_2, '뷰_A3축척': scale_a3_2,
+                                    '_cx': round(ipx, 1), '_cy': round(ipy, 1)})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return symbols
+
+def _transform_xref_texts(xref_texts: List[Tuple[float, float, str, float]], ix: float, iy: float, xscale: float, yscale: float, rot_deg: float) -> List[Tuple[float, float, str, float]]:
+    transformed = []; rad = math.radians(rot_deg); cos_val = math.cos(rad); sin_val = math.sin(rad)
+    for x, y, txt, h in xref_texts:
+        sx = x * xscale; sy = y * yscale
+        rx = sx * cos_val - sy * sin_val; ry = sx * sin_val + sy * cos_val
+        transformed.append((ix + rx, iy + ry, txt, h * yscale))
+    return transformed
+
+def _clean_title_only(title: str) -> str:
+    clean = re.sub(r"NONE|N/A|1\s?[/:,]\s?[\d,]+", " ", title, flags=re.I)
+    clean = re.sub(r"(?:축척|SCALE)?\s*\(\s*1\s*[:/]\s*\)", " ", clean, flags=re.I)
+    clean = re.sub(r"(?:축척|SCALE)\s*1\s*[:/]", " ", clean, flags=re.I)
+    return _clean_text_from_headers(clean)
+
+def _extract_scale_smart(cell_texts: List[Tuple[float, float, str, float]], header_a1_x: Optional[float] = None, header_a3_x: Optional[float] = None, is_list_table: bool = False) -> Tuple[str, str]:
+    texts_to_scan = []; lone_numbers = []
+    if not is_list_table:
+        merged_texts = []
+        if cell_texts:
+            cell_texts_sorted = sorted(cell_texts, key=lambda t: (-t[1], t[0]))
+            curr_line = []; curr_y = None
+            for t in cell_texts_sorted:
+                x, y, txt, h = t
+                if curr_y is None: curr_y = y; curr_line.append(t)
+                elif abs(curr_y - y) <= max(h * 1.5, 1.0): curr_line.append(t)
+                else:
+                    curr_line.sort(key=lambda item: item[0])
+                    merged_texts.append((curr_line[0][0], curr_y, " ".join([item[2] for item in curr_line]), curr_line[0][3]))
+                    curr_y = y; curr_line = [t]
+            if curr_line:
+                curr_line.sort(key=lambda item: item[0])
+                merged_texts.append((curr_line[0][0], curr_y, " ".join([item[2] for item in curr_line]), curr_line[0][3]))
+        texts_to_scan = merged_texts
+    else: texts_to_scan = cell_texts
+
+    a1_val, a3_val = "X", "X"; scales, labels = [], {}
+    for x, y, txt, h in texts_to_scan:
+        u_txt = txt.upper(); clean_txt = u_txt.replace(" ", "")
+        m_a1 = re.search(r'A1.*?(1\s?[/:,]\s?[\d,]+|NONE|N/A)', clean_txt)
+        if m_a1 and a1_val == "X": a1_val = _축척_텍스트_정리(m_a1.group(1))
+        m_a3 = re.search(r'A3.*?(1\s?[/:,]\s?[\d,]+|NONE|N/A)', clean_txt)
+        if m_a3 and a3_val == "X": a3_val = _축척_텍스트_정리(m_a3.group(1))
+        
+        if re.search(r'\bA1\b', u_txt): labels['A1'] = (x, y)
+        if re.search(r'\bA3\b', u_txt): labels['A3'] = (x, y)
+        
+        for m in _축척_패턴.finditer(u_txt):
+            val = _축척_텍스트_정리(m.group(0))
+            if val != "X": scales.append((x, y, val))
+            
+        if not is_list_table and not _축척_패턴.search(u_txt):
+            if re.search(r'^[\d,]+$', clean_txt): lone_numbers.append((x, y, f"1/{clean_txt.replace(',', '')}"))
+            elif clean_txt in ["NONE", "N/A"]: lone_numbers.append((x, y, "NONE"))
+            
+    unique_scales, seen = [], set()
+    for sx, sy, sval in scales + lone_numbers:
+        if (sx, sy, sval) not in seen: seen.add((sx, sy, sval)); unique_scales.append((sx, sy, sval))
+            
+    def dist(x1, y1, x2, y2): return math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+    pairings = []
+    for sx, sy, sval in unique_scales:
+        d_a1 = dist(sx, sy, labels['A1'][0], labels['A1'][1]) if 'A1' in labels else (abs(sx - header_a1_x) if header_a1_x is not None else float('inf'))
+        d_a3 = dist(sx, sy, labels['A3'][0], labels['A3'][1]) if 'A3' in labels else (abs(sx - header_a3_x) if header_a3_x is not None else float('inf'))
+        if d_a1 != float('inf') or d_a3 != float('inf'):
+            if d_a1 <= d_a3: pairings.append((d_a1, sval, 'A1'))
+            else: pairings.append((d_a3, sval, 'A3'))
+            
+    pairings.sort(key=lambda p: p[0])
+    for _, sval, target in pairings:
+        if target == 'A1' and a1_val == "X": a1_val = sval
+        elif target == 'A3' and a3_val == "X": a3_val = sval
+        
+    if unique_scales:
+        unique_scales.sort(key=lambda item: item[0])
+        if a1_val == "X" and a3_val == "X":
+            if len(unique_scales) >= 2: a1_val, a3_val = unique_scales[0][2], unique_scales[1][2]
+            else: a1_val = unique_scales[0][2]
+        elif a1_val == "X" and a3_val != "X":
+            for _, _, sval in unique_scales:
+                if sval != a3_val: a1_val = sval; break
+        elif a3_val == "X" and a1_val != "X":
+            for _, _, sval in unique_scales:
+                if sval != a1_val: a3_val = sval; break
+    return a1_val, a3_val
+
+# ============================================================================
+# 2. 도면목록표 및 개별 도면 파싱 코어 (Master/Slave 분리 적용)
+# ============================================================================
+def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]]) -> pd.DataFrame:
+    logger.info("[LIST] DWG 도면목록표 분석 시작: %s", os.path.basename(dwg_path))
+    데이터 = []
+    list_rois = roi_cfg.get('list_rois', [])
+    global_ignores_stripped = [h.replace(" ", "").upper() for h in GLOBAL_IGNORE_HEADERS]
+    도곽_발견_레이아웃 = 0
+
+    try:
+        doc = _cad_로드(Path(dwg_path))
+        for layout in doc.layouts:
+            도곽들 = _find_도곽_blocks(layout, block_name)
+            if not 도곽들: continue
+            도곽_발견_레이아웃 += 1
+            레이아웃_원본텍스트 = _collect_layout_texts(layout)
+            for 도곽 in 도곽들:
+                ix, iy = float(도곽.dxf.insert.x), float(도곽.dxf.insert.y)
+                xscale, yscale = abs(float(도곽.dxf.xscale)), abs(float(도곽.dxf.yscale))
+                너비, 높이 = base_w * xscale, base_h * yscale
+                rot_deg = getattr(도곽.dxf, 'rotation', 0.0); rad = math.radians(-rot_deg); cos_val, sin_val = math.cos(rad), math.sin(rad)
+                모든텍스트 = 레이아웃_원본텍스트.copy()
+                if xref_texts: 모든텍스트.extend(_transform_xref_texts(xref_texts, ix, iy, xscale, yscale, rot_deg))
+
+                target_ranges = list_rois if list_rois else [[0.0, 1.0, 0.0, 1.0]]
+                for roi in target_ranges:
+                    min_x, max_x = ix + (너비 * roi[0]), ix + (너비 * roi[1])
+                    y_min, y_max = iy + (높이 * roi[2]), iy + (높이 * roi[3]); roi_w = max_x - min_x
+                    num_x_cands, title_x_cands, remark_x_cands, a1_matches, a3_matches, 구역_텍스트 = [], [], [], [], [], []
+                    for t in 모든텍스트:
+                        tx, ty, txt, th = t
+                        dx, dy = tx - ix, ty - iy
+                        unrot_x = ix + (dx * cos_val - dy * sin_val); unrot_y = iy + (dx * sin_val + dy * cos_val)
+                        if min_x <= unrot_x <= max_x and y_min <= unrot_y <= y_max:
+                            clean_t = txt.replace(" ", "").replace("\n", "").strip().upper()
+                            if clean_t in ["도면번호", "도연번호", "DWG.NO", "DWG.NO.", "DWGNO", "DRAWINGNO", "번호"]: num_x_cands.append(unrot_x)
+                            if clean_t in ["도면명", "DRAWINGTITLE", "TITLE", "도면명칭"]: title_x_cands.append(unrot_x)
+                            if clean_t in ["비고", "REMARK", "REMARKS"]: remark_x_cands.append(unrot_x)
+                            if txt == "-" and th > roi_w * 0.8: continue
+                            if not _extract_drawing_number(txt):
+                                if re.search(r"\bA1\b", txt.upper()): a1_matches.append((unrot_x, unrot_y, txt, th))
+                                if re.search(r"\bA3\b", txt.upper()): a3_matches.append((unrot_x, unrot_y, txt, th))
+                            if any(ih == clean_t for ih in global_ignores_stripped): continue
+                            구역_텍스트.append((unrot_x, unrot_y, txt, th))
+                    
+                    if not 구역_텍스트: continue
+                    header_num_x = sum(num_x_cands)/len(num_x_cands) if num_x_cands else min_x + (roi_w * 0.15)
+                    header_title_x = sum(title_x_cands)/len(title_x_cands) if title_x_cands else min_x + (roi_w * 0.5)
+                    header_remark_x = sum(remark_x_cands)/len(remark_x_cands) if remark_x_cands else max_x
+                    header_a1_cands = [m for m in a1_matches if abs(m[0] - header_num_x) > abs(m[0] - header_title_x)]
+                    header_a3_cands = [m for m in a3_matches if abs(m[0] - header_num_x) > abs(m[0] - header_title_x)]
+                    header_a1_item = sorted(header_a1_cands, key=lambda v: -v[1])[0] if header_a1_cands else None
+                    header_a3_item = sorted(header_a3_cands, key=lambda v: -v[1])[0] if header_a3_cands else None
+                    if header_a1_item and header_a1_item in 구역_텍스트: 구역_텍스트.remove(header_a1_item)
+                    if header_a3_item and header_a3_item in 구역_텍스트: 구역_텍스트.remove(header_a3_item)
+                    header_a1_x = header_a1_item[0] if header_a1_item else None
+                    header_a3_x = header_a3_item[0] if header_a3_item else None
+
+                    for i in range(len(구역_텍스트)):
+                        tx, ty, txt, th = 구역_텍스트[i]
+                        if txt.strip() in ["-", "_", "~"]:
+                            closest_y = ty; min_dist = float('inf')
+                            for j in range(len(구역_텍스트)):
+                                if i == j: continue
+                                ox, oy, otxt, oth = 구역_텍스트[j]
+                                if otxt.strip() not in ["-", "_", "~"]:
+                                    if abs(ty - oy) < 높이 * 0.025:
+                                        dist_x = abs(tx - ox)
+                                        if dist_x < min_dist: min_dist = dist_x; closest_y = oy
+                            구역_텍스트[i] = (tx, closest_y, txt, th)
+
+                    구역_텍스트.sort(key=lambda x: -x[1]) 
+                    sub_lines, curr_sub, curr_y = [], [], None
+                    for t in 구역_텍스트:
+                        if curr_y is None or abs(curr_y - t[1]) <= 높이 * 0.012: curr_y = t[1]; curr_sub.append(t)
+                        else:
+                            curr_sub.sort(key=lambda x: x[0]); sub_lines.append({'y': curr_y, 'texts': curr_sub}); curr_y = t[1]; curr_sub = [t]
+                    if curr_sub: curr_sub.sort(key=lambda x: x[0]); sub_lines.append({'y': curr_y, 'texts': curr_sub})
+
+                    rows, unassigned_sub_lines = [], []
+                    for sub in sub_lines:
+                        full_str = " ".join([t[2] for t in sub['texts']])
+                        num_texts = [t for t in sub['texts'] if abs(t[0] - header_num_x) <= abs(t[0] - header_title_x)]
+                        num_str = _spatial_reconstruct_num_str(num_texts)
+                        # 도면번호가 있으면 카테고리 행으로 처리하지 않음
+                        # (예: "AA-911 외부계단 부분상세도-1" 에서 "부분상세도"가 CATEGORY_KEYWORDS에 있어도 무시)
+                        has_draw_num = bool(_extract_drawing_number(num_str) or _extract_drawing_number(full_str))
+                        is_category = False
+                        if not has_draw_num:
+                            if any(kw in full_str.replace(" ", "") for kw in CATEGORY_KEYWORDS): is_category = True
+                            elif re.search(r"^[A-Z0-9\-_]*\s*[\[<【].+?[\]>】]\s*$", full_str): is_category = True
+                        if is_category: continue
+                        raw_drw_no = _extract_drawing_number(num_str) or _extract_drawing_number(full_str)
+                        drw_no, raw_matched_str = "", ""
+                        if raw_drw_no: drw_no = _도면번호_세척(raw_drw_no); raw_matched_str = raw_drw_no
+                        else:
+                            if num_texts:
+                                fallback_match = re.sub(r"\s*[가-힣\[<【\(].*$", "", num_str).strip("-_ ")
+                                if not fallback_match: fallback_match = num_str.strip()
+                                if re.search(r"\d", fallback_match) and len(fallback_match) >= 3 and not re.search(r"[\[\]<>\(【】]", fallback_match):
+                                    drw_no = _도면번호_세척(fallback_match); raw_matched_str = fallback_match
+
+                        if drw_no: rows.append({'anchor_y': sub['y'], 'sub_lines': [{'y': sub['y'], 'texts': sub['texts'], 'raw_drw_no': raw_matched_str}], 'drw_no': drw_no})
+                        else: unassigned_sub_lines.append({'y': sub['y'], 'texts': sub['texts']})
+
+                    for sub in unassigned_sub_lines:
+                        if not rows: continue
+                        closest_row = min(rows, key=lambda r: abs(r['anchor_y'] - sub['y']))
+                        if abs(closest_row['anchor_y'] - sub['y']) < 높이 * 0.04: closest_row['sub_lines'].append(sub)
+
+                    avg_char_h = (sum(t[3] for t in 구역_텍스트) / len(구역_텍스트)) if 구역_텍스트 else 1.0
+
+                    # 1차 패스: 모든 행의 도면명과 그룹 후보를 미리 계산
+                    precomputed = []
+                    for row in rows:
+                        row['sub_lines'].sort(key=lambda s: -s['y']); pw, at = [], []
+                        for sub in row['sub_lines']:
+                            sts = sorted(sub['texts'], key=lambda x: x[0])
+                            tt = [t for t in sts if not (header_remark_x and abs(t[0] - header_remark_x) < abs(t[0] - header_title_x))]
+                            rls = _spatial_reconstruct_num_str(tt); to = rls
+                            if sub.get('raw_drw_no') and sub['raw_drw_no'] in rls:
+                                parts = rls.split(sub['raw_drw_no'], 1); to = parts[1] if len(parts) > 1 else ""
+                            to = _merge_title_char_runs(to); cl = _clean_title_only(to)
+                            if cl: pw.append(cl)
+                            at.extend(sts)
+                        m = " ".join(pw).strip()
+                        ed = _extract_dong_from_title(m); eg = _extract_group_from_title(m) if not ed else ""
+                        precomputed.append({'drw_no': row['drw_no'], 'title': m, 'dong': ed, 'group': eg, 'candidate': ed or eg, 'all_texts': at})
+
+                    # 2차 패스: 연속 행에 같은 후보가 반복되면 그룹이 아닌 도면명의 일부로 처리
+                    prop_group = ""
+                    for i, pc in enumerate(precomputed):
+                        번호 = pc['drw_no']; 명칭 = pc['title']
+                        extracted_dong = pc['dong']; extracted_group = pc['group']; candidate = pc['candidate']
+                        all_texts = pc['all_texts']
+                        if candidate:
+                            prev_cand = precomputed[i - 1]['candidate'] if i > 0 else ""
+                            next_cand = precomputed[i + 1]['candidate'] if i + 1 < len(precomputed) else ""
+                            if next_cand == candidate or prev_cand == candidate:
+                                # 이전/다음 행도 같은 접두어 → 그룹이 아닌 도면명의 일부
+                                current_group = prop_group
+                            else:
+                                if extracted_dong: 명칭 = re.sub(r"^" + re.escape(extracted_dong) + r"\s*", "", 명칭).strip()
+                                if extracted_group: 명칭 = re.sub(r"^" + re.escape(extracted_group) + r"\s*", "", 명칭).strip()
+                                prop_group = candidate; current_group = candidate
+                        else:
+                            current_group = prop_group
+                        a1, a3 = _extract_scale_smart(all_texts, header_a1_x, header_a3_x, is_list_table=True)
+                        데이터.append({"도면번호(LIST)": 번호, "구분_LIST(그룹)": current_group, "도면명(LIST)": 명칭, "축척_A1(LIST)": a1, "축척_A3(LIST)": a3})
+    except Exception:
+        logger.exception("목록표 분석 중 오류")
+    if 도곽_발견_레이아웃 == 0:
+        logger.warning("[경고] 도면목록표에서 '%s' 도곽 블록을 찾지 못했습니다. 블록 이름과 ROI 설정을 확인하세요.", block_name)
+    df = pd.DataFrame(데이터)
+    if df.empty:
+        logger.warning("[경고] 도면목록표 추출 결과가 0건입니다. ROI(단 박스) 범위를 다시 확인해 주세요.")
+        return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(그룹)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"])
+    before = len(df)
+    df = df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
+    if before != len(df):
+        logger.warning("[경고] 도면목록표에 도면번호 중복 행 %d개 발견 → 첫 행만 채택했습니다.", before - len(df))
+    return df
+
+def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[float, float, str, float]]]) -> Tuple[List[dict], List[dict], str]:
+    전체경로, 목표블록, roi_cfg, base_w, base_h, xref_texts = args
+    파일명, 데이터, 뷰심볼, 에러메시지 = os.path.basename(전체경로), [], [], ""
+    view_roi = roi_cfg.get('view_symbol_roi')
+    seen_circles: set = set()  # 파일 전체 기준 원 중복 방지
+    try:
+        doc = _cad_로드(Path(전체경로)); 도곽_발견됨 = False
+        for layout in doc.layouts:
+            도곽들 = _find_도곽_blocks(layout, 목표블록)
+            if not 도곽들: continue
+            도곽_발견됨 = True; 레이아웃_원본텍스트 = _collect_layout_texts(layout)
+            for 도곽 in 도곽들:
+                ix, iy = float(도곽.dxf.insert.x), float(도곽.dxf.insert.y)
+                xscale, yscale = abs(float(도곽.dxf.xscale)), abs(float(도곽.dxf.yscale))
+                너비, 높이 = base_w * xscale, base_h * yscale
+                rot_deg = getattr(도곽.dxf, 'rotation', 0.0); rad = math.radians(-rot_deg); cos_val, sin_val = math.cos(rad), math.sin(rad)
+                모든텍스트 = 레이아웃_원본텍스트.copy()
+                if xref_texts: 모든텍스트.extend(_transform_xref_texts(xref_texts, ix, iy, xscale, yscale, rot_deg))
+
+                def get_data_in_roi(roi):
+                    # [핵심] 비율은 Master의 roi_cfg에 저장된 것을 그대로 씁니다.
+                    x_min, x_max = ix + (너비 * roi[0]), ix + (너비 * roi[1])
+                    y_min, y_max = iy + (높이 * roi[2]), iy + (높이 * roi[3]); 박스내글자 = []
+                    for t in 모든텍스트:
+                        tx, ty, txt, th = t
+                        dx, dy = tx - ix, ty - iy
+                        unrot_x = ix + (dx * cos_val - dy * sin_val); unrot_y = iy + (dx * sin_val + dy * cos_val)
+                        if x_min <= unrot_x <= x_max and y_min <= unrot_y <= y_max:
+                            if txt == "-" and th > (x_max - x_min) * 0.8: continue
+                            박스내글자.append((unrot_x, unrot_y, txt, th)) 
+                    if not 박스내글자: return "", []
+                    for i in range(len(박스내글자)):
+                        tx, ty, txt, th = 박스내글자[i]
+                        if txt.strip() in ["-", "_", "~"]:
+                            closest_y = ty; min_dist = float('inf')
+                            for j in range(len(박스내글자)):
+                                if i == j: continue
+                                ox, oy, otxt, oth = 박스내글자[j]
+                                if otxt.strip() not in ["-", "_", "~"]:
+                                    if abs(ty - oy) < 높이 * 0.025:
+                                        dist_x = abs(tx - ox)
+                                        if dist_x < min_dist: min_dist = dist_x; closest_y = oy
+                            박스내글자[i] = (tx, closest_y, txt, th)
+                    박스내글자.sort(key=lambda t: -t[1])
+                    lines, current_line, current_y = [], [], None
+                    for t in 박스내글자:
+                        if current_y is None: current_y = t[1]; current_line.append(t)
+                        elif abs(current_y - t[1]) <= 높이 * 0.015: current_line.append(t)
+                        else:
+                            current_line.sort(key=lambda x: x[0]); lines.append(" ".join([x[2] for x in current_line])); current_y = t[1]; current_line = [t]
+                    if current_line: current_line.sort(key=lambda x: x[0]); lines.append(" ".join([x[2] for x in current_line]))
+                    return " ".join(lines), 박스내글자
+
+                n_str, _ = get_data_in_roi(roi_cfg['num_roi']); t_str, _ = get_data_in_roi(roi_cfg['title_roi']); _, s_texts = get_data_in_roi(roi_cfg['scale_roi']) 
+                n_str_clean = _clean_text_from_headers(n_str); t_str_clean = _clean_text_from_headers(t_str)
+
+                번호_후보 = _extract_drawing_number(n_str_clean); raw_matched_str = ""
+                if 번호_후보: 번호 = _도면번호_세척(번호_후보); raw_matched_str = 번호_후보
+                else: 
+                    fallback_match = re.sub(r"\s*[가-힣\[<【\(].*$", "", n_str_clean).strip("-_ ")
+                    번호 = _도면번호_세척(fallback_match); raw_matched_str = fallback_match
+                
+                명칭 = t_str_clean
+                if raw_matched_str and raw_matched_str in 명칭: 명칭 = 명칭.replace(raw_matched_str, "")
+                dwg_dong = _extract_dong_from_title(명칭)
+                dwg_group = _extract_group_from_title(명칭) if not dwg_dong else ""
+                dwg_group_info = dwg_dong or dwg_group
+                if dwg_dong:
+                    명칭 = re.sub(r"^" + re.escape(dwg_dong) + r"\s*", "", 명칭).strip()
+                if dwg_group:
+                    명칭 = re.sub(r"^" + re.escape(dwg_group) + r"\s*", "", 명칭).strip()
+
+                명칭 = _clean_title_only(명칭); a1, a3 = _extract_scale_smart(s_texts, is_list_table=False)
+                if 번호:
+                    데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "구분_DWG(그룹)": dwg_group_info, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
+                    # 도곽마다 해당 위치 기준의 ROI에서 뷰 심볼 추출
+                    # seen_circles로 ROI 중복 시 같은 원이 두 번 들어가는 것을 방지
+                    if view_roi:
+                        for sym in _extract_view_symbols(layout, ix, iy, xscale, yscale, base_w, base_h, view_roi, rot_deg):
+                            # 같은 물리적 원이 여러 도곽 ROI에서 중복 검출되는 것만 방지
+                            pos_key = (sym['_cx'], sym['_cy'])
+                            if pos_key in seen_circles:
+                                continue
+                            seen_circles.add(pos_key)
+                            sym.pop('_cx'); sym.pop('_cy')
+                            sym.update({"파일명": 파일명, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
+                            뷰심볼.append(sym)
+        del doc
+        if not 도곽_발견됨: return 데이터, 뷰심볼, "도곽 블록 없음"
+    except Exception as e:
+        에러메시지 = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+    return 데이터, 뷰심볼, 에러메시지
+
+def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]], progress_cb=None, cancel_event: Optional[threading.Event] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    모든_캐드파일 = []
+    for d in target_dirs:
+        폴더 = Path(d)
+        if 폴더.exists(): 모든_캐드파일.extend([str(p) for p in 폴더.iterdir() if p.is_file() and p.suffix.lower() in [".dwg", ".dxf"]])
+    캐드파일들 = sorted(list(set(모든_캐드파일)))
+    _빈_dwg = pd.DataFrame(columns=["파일명", "도면번호(DWG)", "구분_DWG(그룹)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
+    _빈_뷰 = pd.DataFrame(columns=["파일명", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "뷰_도면명", "뷰_A1축척", "뷰_A3축척"])
+    if not 캐드파일들:
+        logger.warning("[CAD ] 폴더 내에 처리할 도면 파일이 없습니다."); return _빈_dwg, _빈_뷰
+
+    총개수 = len(캐드파일들)
+    logger.info("[CAD ] 총 %d개의 개별 도면 분석 중... (터보 모드 가동 🚀)", 총개수)
+    if progress_cb:
+        try: progress_cb(0, 총개수)
+        except Exception: pass
+
+    최종_데이터, 최종_뷰심볼 = [], []
+    취소됨 = False
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = {executor.submit(_process_single_dwg, (path, slave_block_name.strip().lower(), roi_cfg, base_w, base_h, xref_texts)): path for path in 캐드파일들}
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            if cancel_event is not None and cancel_event.is_set():
+                logger.warning("[취소] 사용자 요청으로 잔여 작업을 중단합니다. (완료 %d / 전체 %d)", i - 1, 총개수)
+                for f in futures: f.cancel()
+                try:
+                    executor.shutdown(cancel_futures=True, wait=False)
+                except TypeError:
+                    executor.shutdown(wait=False)  # Python 3.8 이하 호환
+                취소됨 = True
+                break
+            경로 = futures[future]
+            try:
+                결과, 뷰심볼, 에러 = future.result()
+                if 결과: 최종_데이터.extend(결과)
+                if 뷰심볼: 최종_뷰심볼.extend(뷰심볼)
+                # 에러 메시지에 traceback이 포함되어 있을 수 있으므로 한 줄로 축약하여 표시
+                에러_요약 = 에러.splitlines()[0] if 에러 else "성공"
+                logger.info("   [%d/%d] %s: %s (%s)", i, 총개수, '완료' if 결과 else '패스', os.path.basename(경로), 에러_요약)
+                if 에러 and "\n" in 에러:
+                    logger.debug("   ↳ 상세 trace:\n%s", 에러)
+            except Exception:
+                logger.exception("   [%d/%d] 시스템 오류: %s", i, 총개수, os.path.basename(경로))
+            if progress_cb:
+                try: progress_cb(i, 총개수)
+                except Exception: pass
+
+    if 취소됨:
+        logger.warning("[취소] 완료된 %d개의 데이터까지만 리포트에 반영됩니다.", len(최종_데이터))
+    elif not 최종_데이터:
+        logger.warning("[경고] 개별 도면에서 추출된 데이터가 0건입니다. 도곽 블록 이름과 ROI 설정을 확인하세요.")
+    dwg_df = pd.DataFrame(최종_데이터) if 최종_데이터 else _빈_dwg
+    view_df = pd.DataFrame(최종_뷰심볼) if 최종_뷰심볼 else _빈_뷰
+    return dwg_df, view_df
+
+def _build_view_sheet(ws, view_df: pd.DataFrame):
+    빨간색 = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
+    헤더색 = PatternFill(start_color="FFD6E4F7", end_color="FFD6E4F7", fill_type="solid")
+    cols = {
+        "파일명": "파일명",
+        "도면명(DWG)": "도곽 도면명",
+        "축척_A1(DWG)": "도곽 A1축척",
+        "축척_A3(DWG)": "도곽 A3축척",
+        "뷰_도면명": "뷰 도면명",
+        "뷰_A1축척": "뷰 A1축척",
+        "뷰_A3축척": "뷰 A3축척",
+        "도면명_포함": "도면명 포함",
+        "축척_일치": "축척 일치",
+        "상태": "상태",
+    }
+    df = view_df.copy()
+
+    def _chk_title(row):
+        return "O" if _title_contains_view(str(row.get("도면명(DWG)", "")), str(row.get("뷰_도면명", ""))) else "X"
+
+    def _chk_scale(row):
+        v_a1 = re.sub(r"[,\s]", "", str(row.get("뷰_A1축척", ""))).upper()
+        v_a3 = re.sub(r"[,\s]", "", str(row.get("뷰_A3축척", ""))).upper()
+        d_a1 = re.sub(r"[,\s]", "", str(row.get("축척_A1(DWG)", ""))).upper()
+        d_a3 = re.sub(r"[,\s]", "", str(row.get("축척_A3(DWG)", ""))).upper()
+        if not v_a1 and not v_a3:
+            return "?"
+        results = []
+        if v_a1 and v_a1 not in ("X", "NONE"):
+            results.append(v_a1 == d_a1)
+        if v_a3 and v_a3 not in ("X", "NONE"):
+            results.append(v_a3 == d_a3)
+        if not results:
+            return "?"
+        return "O" if all(results) else "X"
+
+    df["도면명_포함"] = df.apply(_chk_title, axis=1)
+    df["축척_일치"]  = df.apply(_chk_scale, axis=1)
+    def _view_status(r):
+        title_ok = r["도면명_포함"] == "O"
+        scale_ok = r["축척_일치"] == "O"
+        if title_ok and scale_ok: return "일치"
+        parts = []
+        if not title_ok: parts.append("도면명")
+        if not scale_ok: parts.append("축척")
+        return "/".join(parts) + " 불일치"
+    df["상태"] = df.apply(_view_status, axis=1)
+
+    # 같은 파일 내에서 뷰 도면명이 중복이면 오타 가능성 → "중복" 상태로 덮어쓰기
+    dup_mask = df.duplicated(subset=["파일명", "뷰_도면명"], keep=False)
+    df.loc[dup_mask, "상태"] = "중복"
+
+    col_keys = list(cols.keys())
+    주황색 = PatternFill(start_color="FFFFD699", end_color="FFFFD699", fill_type="solid")
+    for j, (key, label) in enumerate(cols.items(), 1):
+        c = ws.cell(1, j, label); c.fill = 헤더색
+    for i, row in enumerate(df[col_keys].fillna("").itertuples(index=False), 2):
+        for j, val in enumerate(row, 1):
+            ws.cell(i, j, str(val))
+        status = ws.cell(i, col_keys.index("상태") + 1).value
+        if status == "중복":
+            for j in range(1, len(col_keys) + 1):
+                ws.cell(i, j).fill = 주황색
+        elif status != "일치":
+            for j in range(1, len(col_keys) + 1):
+                ws.cell(i, j).fill = 빨간색
+
+def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, view_df: Optional[pd.DataFrame] = None):
+    if list_df.empty and dwg_df.empty: logger.warning("[알림] 추출된 데이터가 없어 엑셀 리포트를 생성하지 않습니다."); return
+
+    lst, dwg = list_df.copy(), dwg_df.copy()
+    if "도면번호(LIST)" not in lst.columns: lst["도면번호(LIST)"] = ""
+    if "도면번호(DWG)" not in dwg.columns: dwg["도면번호(DWG)"] = ""
+    if "구분_LIST(그룹)" not in lst.columns: lst["구분_LIST(그룹)"] = ""
+    if "구분_DWG(그룹)" not in dwg.columns: dwg["구분_DWG(그룹)"] = ""
+
+    lst["KEY"] = lst["도면번호(LIST)"].astype(str).str.upper().str.replace(r"[\s\-_]", "", regex=True)
+    dwg["KEY"] = dwg["도면번호(DWG)"].astype(str).str.upper().str.replace(r"[\s\-_]", "", regex=True)
+    결과 = pd.merge(lst, dwg, on="KEY", how="outer", indicator=True)
+    결과["상태"] = 결과["_merge"].map({"both": "일치", "left_only": "DWG 누락", "right_only": "목록표 누락"})
+
+    group_mismatch_indices = set()
+    for i in range(len(결과)):
+        l_g = str(결과.at[i, "구분_LIST(그룹)"]).strip(); d_g = str(결과.at[i, "구분_DWG(그룹)"]).strip()
+        if l_g == "nan": l_g = ""
+        if d_g == "nan": d_g = ""
+        if l_g and d_g and l_g != d_g: group_mismatch_indices.add(i + 2)
+
+    prev_group = ""; group_col_idx = 결과.columns.get_loc("구분_LIST(그룹)")
+    for i in range(len(결과)):
+        curr_group = str(결과.iat[i, group_col_idx]).strip()
+        if curr_group == "nan" or not curr_group: prev_group = ""; 결과.iat[i, group_col_idx] = ""; continue
+        if curr_group == prev_group: 결과.iat[i, group_col_idx] = ""
+        else: prev_group = curr_group
+
+    prev_dwg_group = ""; dwg_group_col_idx = 결과.columns.get_loc("구분_DWG(그룹)")
+    for i in range(len(결과)):
+        curr_group = str(결과.iat[i, dwg_group_col_idx]).strip()
+        if curr_group == "nan" or not curr_group: prev_dwg_group = ""; 결과.iat[i, dwg_group_col_idx] = ""; continue
+        if curr_group == prev_dwg_group: 결과.iat[i, dwg_group_col_idx] = ""
+        else: prev_dwg_group = curr_group
+
+    cols = ["도면번호(LIST)", "구분_LIST(그룹)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)",
+            "도면번호(DWG)", "구분_DWG(그룹)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "파일명", "상태"]
+    for c in cols: 
+        if c not in 결과.columns: 결과[c] = ""
+    
+    결과[cols].fillna("X").to_excel(out_path, index=False)
+    wb = load_workbook(out_path); ws = wb.active
+    ws.title = "목록표 검토"
+    빨간색 = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
+    h = {cell.value: cell.column for cell in ws[1] if cell.value}
+
+    for row in range(2, ws.max_row + 1):
+        status = ws.cell(row, h["상태"]).value
+        if status in ("DWG 누락", "목록표 누락"):
+            for c in range(1, len(cols)+1): ws.cell(row, c).fill = 빨간색
+            continue
+
+        issues = []
+        if row in group_mismatch_indices:
+            issues.append("그룹")
+            if h.get("구분_LIST(그룹)"): ws.cell(row, h["구분_LIST(그룹)"]).fill = 빨간색
+            if h.get("구분_DWG(그룹)"): ws.cell(row, h["구분_DWG(그룹)"]).fill = 빨간색
+        val_list = re.sub(r"[\s\-_]", "", str(ws.cell(row, h["도면번호(LIST)"]).value).upper())
+        val_dwg  = re.sub(r"[\s\-_]", "", str(ws.cell(row, h["도면번호(DWG)"]).value).upper())
+        if val_list != val_dwg:
+            issues.append("도면번호")
+            ws.cell(row, h["도면번호(LIST)"]).fill = 빨간색
+            ws.cell(row, h["도면번호(DWG)"]).fill  = 빨간색
+        name_list = str(ws.cell(row, h["도면명(LIST)"]).value).replace(" ", "")
+        name_dwg  = str(ws.cell(row, h["도면명(DWG)"]).value).replace(" ", "")
+        if name_list != name_dwg:
+            issues.append("도면명")
+            ws.cell(row, h["도면명(LIST)"]).fill = 빨간색
+            ws.cell(row, h["도면명(DWG)"]).fill  = 빨간색
+        scale_bad = False
+        for s in ["A1", "A3"]:
+            p_v = str(ws.cell(row, h[f"축척_{s}(LIST)"]).value).replace(" ","")
+            d_v = str(ws.cell(row, h[f"축척_{s}(DWG)"]).value).replace(" ","")
+            if p_v != d_v:
+                scale_bad = True
+                ws.cell(row, h[f"축척_{s}(LIST)"]).fill = 빨간색
+                ws.cell(row, h[f"축척_{s}(DWG)"]).fill  = 빨간색
+        if scale_bad:
+            issues.append("축척")
+        if issues:
+            ws.cell(row, h["상태"]).value = "/".join(issues) + " 불일치"
+            ws.cell(row, h["상태"]).fill  = 빨간색
+
+    if view_df is not None and not view_df.empty:
+        ws_view = wb.create_sheet("뷰심볼 검토")
+        _build_view_sheet(ws_view, view_df)
+        logger.info("[XLSX] 뷰심볼 검토 시트 추가: %d건", len(view_df))
+
+    wb.save(out_path)
+    logger.info("[XLSX] 리포트 저장 완료: %s", out_path)
+
+# ============================================================================
+# 3. [GUI 구축] CustomTkinter + TkinterDnD (드래그 앤 드롭 지원)
+# ============================================================================
+class GUILogHandler(logging.Handler):
+    """로그 레코드를 GUI 텍스트박스에 출력하는 핸들러. Tkinter는 메인 스레드 외부 위젯 호출이 안전하지 않으므로 after()로 마샬링한다."""
+    def __init__(self, textbox: ctk.CTkTextbox):
+        super().__init__()
+        self.textbox = textbox
+
+    def _append(self, msg: str):
+        try:
+            self.textbox.configure(state="normal")
+            self.textbox.insert("end", msg + "\n")
+            self.textbox.see("end")
+            self.textbox.configure(state="disabled")
+        except Exception:
+            pass  # 위젯이 이미 파괴된 경우 등
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+            self.textbox.after(0, self._append, msg)
+        except Exception:
+            pass
+
+# [핵심] ctk.CTk와 TkinterDnD.DnDWrapper를 결합하여 D&D 윈도우 생성
+class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
+    def __init__(self):
+        super().__init__()
+        self.TkdndVersion = TkinterDnD._require(self)
+        
+        self.title("AutoDWG 도면 검토 자동화 시스템")
+        self.geometry("760x860")
+        self.resizable(False, False)
+        
+        self.xref_path = ""
+        self.list_path = ""
+        self.dwg_folders = []
+        self.cancel_event = threading.Event()
+
+        self._build_ui()
+
+        gui_handler = GUILogHandler(self.log_box)
+        gui_handler.setLevel(logging.DEBUG)
+        gui_handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(gui_handler)
+
+        logger.info("=" * 72)
+        logger.info(" AutoDWG 검토 자동화 시스템  v6.8 _ © 2026. 김정현. All rights reserved.")
+        logger.info("=" * 72)
+        logger.info(" 환영합니다! 파일이나 폴더를 '드래그 앤 드롭' 하거나 버튼으로 추가하세요.\n")
+
+    def _parse_dnd_paths(self, dnd_data):
+        # 윈도우 탐색기에서 넘어온 복잡한 경로 문자열({} 포함 등)을 깔끔한 리스트로 분리
+        return self.tk.splitlist(dnd_data)
+
+    def _build_ui(self):
+        F_H1   = ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold")
+        F_H2   = ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold")
+        F_BODY = ctk.CTkFont(family="Malgun Gothic", size=12)
+        F_SM   = ctk.CTkFont(family="Malgun Gothic", size=10)
+        F_BTN  = ctk.CTkFont(family="Malgun Gothic", size=14, weight="bold")
+        F_MONO = ctk.CTkFont(family="Consolas", size=11)
+
+        BG      = "#f2f4f8"
+        CARD    = "#ffffff"
+        HDRBG   = "#e8f0fd"
+        PRIMARY = "#1e5fbe"
+        DANGER  = "#d94f43"
+        DIM     = "#8a94a6"
+
+        self.configure(fg_color=BG)
+
+        topbar = ctk.CTkFrame(self, fg_color=PRIMARY, corner_radius=0, height=58)
+        topbar.pack(fill="x")
+        topbar.pack_propagate(False)
+        inn = ctk.CTkFrame(topbar, fg_color="transparent")
+        inn.pack(fill="both", expand=True, padx=22)
+        ctk.CTkLabel(inn, text="AutoDWG  검토 자동화 시스템",
+                     font=F_H1, text_color="white", anchor="w").pack(side="left", fill="y")
+        ctk.CTkLabel(inn, text="v 6.8 _ © 2026. 김정현. All rights reserved.", font=F_SM,
+                     text_color="#a8c8ff", anchor="e").pack(side="right")
+
+        page = ctk.CTkScrollableFrame(self, fg_color=BG,
+                                      scrollbar_button_color="#c0c8d8",
+                                      scrollbar_button_hover_color="#a8b4cc")
+        page.pack(fill="both", expand=True)
+
+        def _card(heading):
+            outer = ctk.CTkFrame(page, fg_color=CARD, corner_radius=10)
+            outer.pack(fill="x", padx=16, pady=5)
+            hdr = ctk.CTkFrame(outer, fg_color=HDRBG, corner_radius=8, height=30)
+            hdr.pack(fill="x", padx=1, pady=(1, 0))
+            hdr.pack_propagate(False)
+            ctk.CTkLabel(hdr, text=heading, font=F_H2,
+                         text_color=PRIMARY, anchor="w").pack(side="left", padx=12)
+            body = ctk.CTkFrame(outer, fg_color="transparent")
+            body.pack(fill="x", padx=12, pady=(6, 10))
+            return outer, body
+
+        def _file_row(parent, label, cmd):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", pady=3)
+            ctk.CTkLabel(row, text=label, font=F_H2,
+                         width=120, anchor="w").pack(side="left")
+            ctk.CTkButton(row, text="파일 선택", font=F_BODY,
+                          width=88, height=28, command=cmd).pack(side="left", padx=(0, 10))
+            lbl = ctk.CTkLabel(row, text="선택된 파일 없음",
+                               font=F_BODY, text_color=DIM, anchor="w")
+            lbl.pack(side="left", fill="x", expand=True)
+            return lbl
+
+        c1, b1 = _card("①  도곽 원본 (XREF)  및  블록 이름")
+        c1.drop_target_register(DND_FILES)
+        c1.dnd_bind("<<Drop>>", self.drop_xref)
+        self.lbl_xref = _file_row(b1, "원본 DWG", self.select_xref)
+        row_blk = ctk.CTkFrame(b1, fg_color="transparent")
+        row_blk.pack(fill="x", pady=3)
+        ctk.CTkLabel(row_blk, text="블록 이름", font=F_H2,
+                     width=120, anchor="w").pack(side="left")
+        self.entry_block_name = ctk.CTkEntry(row_blk, font=F_BODY, width=300, height=28,
+                                              placeholder_text="파일 선택 시 자동 입력됨")
+        self.entry_block_name.pack(side="left")
+
+        # [V6.9] 카드 ①에 통합 — 개별도면 도곽 이름이 다른 경우 (협력업체 도곽 등 흔한 케이스)
+        self.check_diff_name = ctk.CTkCheckBox(
+            b1, text="개별 도면의 도곽 이름이 다른 경우 체크",
+            font=F_BODY, command=self.toggle_diff_name)
+        self.check_diff_name.pack(anchor="w", pady=(6, 2))
+        self.frame_diff = ctk.CTkFrame(b1, fg_color="transparent")
+        ctk.CTkLabel(self.frame_diff, text="↳  개별도면 도곽 이름 :",
+                     font=F_H2, text_color=DANGER).pack(side="left", padx=(20, 10))
+        self.entry_slave_block = ctk.CTkEntry(self.frame_diff, font=F_BODY, width=230, height=28,
+                                               placeholder_text="예: XR-form")
+        self.entry_slave_block.pack(side="left")
+
+        c2, b2 = _card("②  도면목록표  DWG")
+        c2.drop_target_register(DND_FILES)
+        c2.dnd_bind("<<Drop>>", self.drop_list)
+        self.lbl_list = _file_row(b2, "목록표 DWG", self.select_list)
+
+        c3, b3 = _card("③  개별 도면 폴더")
+        btn_r = ctk.CTkFrame(b3, fg_color="transparent")
+        btn_r.pack(fill="x", pady=(0, 5))
+        ctk.CTkButton(btn_r, text="＋  폴더 추가", font=F_BODY, width=110, height=28,
+                      command=self.add_folder).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_r, text="초기화", font=F_BODY, width=68, height=28,
+                      fg_color=DANGER, hover_color="#b5362c",
+                      command=self.clear_folders).pack(side="left")
+        self.textbox_folders = ctk.CTkTextbox(b3, height=72, font=F_SM,
+                                               fg_color="#f7f8fa", corner_radius=6,
+                                               border_width=1, border_color="#dde2ea")
+        self.textbox_folders.pack(fill="x")
+        self.textbox_folders.insert("1.0", "폴더를 추가하거나 이 영역에 폴더를 끌어다 놓으세요.")
+        self.textbox_folders.configure(state="disabled")
+        c3.drop_target_register(DND_FILES)
+        c3.dnd_bind("<<Drop>>", self.drop_folders)
+        self.textbox_folders.drop_target_register(DND_FILES)
+        self.textbox_folders.dnd_bind("<<Drop>>", self.drop_folders)
+
+        self.btn_wrap = ctk.CTkFrame(page, fg_color="transparent")
+        self.btn_wrap.pack(fill="x", padx=16, pady=(8, 0))
+        self.btn_start = ctk.CTkButton(self.btn_wrap, text="검토 시작  →",
+                                        font=F_BTN, height=46, corner_radius=8,
+                                        fg_color=PRIMARY, hover_color="#174da8",
+                                        command=self.start_process)
+        self.btn_start.pack(fill="x")
+        self.btn_cancel = ctk.CTkButton(self.btn_wrap, text="⏹  취소",
+                                         font=F_BTN, height=46, corner_radius=8,
+                                         fg_color=DANGER, hover_color="#b5362c",
+                                         command=self.cancel_process)
+        # self.btn_cancel은 처리 중에만 pack됨
+
+        self.progressbar = ctk.CTkProgressBar(page, mode="determinate", height=8,
+                                               fg_color="#dde4ef", progress_color=PRIMARY,
+                                               corner_radius=2)
+        self.progressbar.set(0)
+        self.lbl_progress = ctk.CTkLabel(page, text="", font=F_SM, text_color=DIM)
+
+        _, blog = _card("작업 로그")
+        self.log_box = ctk.CTkTextbox(blog, height=200, font=F_MONO,
+                                       fg_color="#1e1e2e", text_color="#cdd6f4",
+                                       corner_radius=6)
+        self.log_box.pack(fill="both", expand=True)
+        self.log_box.configure(state="disabled")
+
+        ctk.CTkFrame(page, fg_color="transparent", height=10).pack()
+
+    # ================= UI 로직 =================
+    def toggle_diff_name(self):
+        if self.check_diff_name.get(): self.frame_diff.pack(fill="x", after=self.check_diff_name, pady=5)
+        else: self.frame_diff.pack_forget()
+
+    # ================= D&D 핸들러 =================
+    def drop_xref(self, event):
+        paths = self._parse_dnd_paths(event.data)
+        if paths and paths[0].lower().endswith(('.dwg', '.dxf')):
+            self.xref_path = paths[0]
+            self.lbl_xref.configure(text=os.path.basename(self.xref_path), text_color="black")
+            base_name = os.path.splitext(os.path.basename(self.xref_path))[0]
+            self.entry_block_name.delete(0, "end"); self.entry_block_name.insert(0, base_name)
+            logger.info("[알림] 드래그 앤 드롭: 원본 도곽 이름(%s) 자동 입력됨.", base_name)
+
+    def drop_list(self, event):
+        paths = self._parse_dnd_paths(event.data)
+        if paths and paths[0].lower().endswith(('.dwg', '.dxf')):
+            self.list_path = paths[0]
+            self.lbl_list.configure(text=os.path.basename(self.list_path), text_color="blue")
+            logger.info("[알림] 드래그 앤 드롭: 도면목록표 인식 완료.")
+
+    def drop_folders(self, event):
+        paths = self._parse_dnd_paths(event.data)
+        for p in paths:
+            if os.path.isdir(p) and p not in self.dwg_folders:
+                self.dwg_folders.append(p)
+        self.update_folder_textbox()
+
+    # ================= 기존 버튼 핸들러 =================
+    def select_xref(self):
+        path = filedialog.askopenfilename(title="외부참조(XREF) 파일 선택", filetypes=[("AutoCAD Files", "*.dwg *.dxf")])
+        if path:
+            self.xref_path = path
+            self.lbl_xref.configure(text=os.path.basename(path), text_color="black")
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            self.entry_block_name.delete(0, "end"); self.entry_block_name.insert(0, base_name)
+            logger.info("[알림] 원본 파일명 기반으로 도곽 블록 이름(%s)이 자동 입력되었습니다.", base_name)
+
+    def select_list(self):
+        path = filedialog.askopenfilename(title="도면목록표 파일 선택", filetypes=[("AutoCAD Files", "*.dwg *.dxf")])
+        if path:
+            self.list_path = path
+            self.lbl_list.configure(text=os.path.basename(path), text_color="blue")
+
+    def add_folder(self):
+        path = filedialog.askdirectory(title="개별 도면이 있는 폴더 선택")
+        if path and path not in self.dwg_folders:
+            self.dwg_folders.append(path)
+            self.update_folder_textbox()
+
+    def clear_folders(self):
+        self.dwg_folders.clear()
+        self.update_folder_textbox()
+
+    def update_folder_textbox(self):
+        self.textbox_folders.configure(state="normal")
+        self.textbox_folders.delete("1.0", "end")
+        if not self.dwg_folders: self.textbox_folders.insert("1.0", "여기에 폴더를 끌어다 놓으세요.")
+        else:
+            for i, f in enumerate(self.dwg_folders, 1): self.textbox_folders.insert("end", f"[{i}] {f}\n")
+        self.textbox_folders.configure(state="disabled")
+
+    # ================= 진행률 / 취소 =================
+    def _on_progress(self, current: int, total: int):
+        """워커 스레드에서 호출되는 진행률 콜백. 메인 스레드로 마샬링."""
+        self.after(0, self._update_progress_ui, current, total)
+
+    def _update_progress_ui(self, current: int, total: int):
+        try:
+            if total > 0:
+                self.progressbar.set(current / total)
+                self.lbl_progress.configure(text=f"진행 {current} / {total}  ({current * 100 // total}%)")
+            else:
+                self.progressbar.set(0)
+                self.lbl_progress.configure(text="")
+        except Exception:
+            pass
+
+    def cancel_process(self):
+        self.cancel_event.set()
+        try:
+            self.btn_cancel.configure(state="disabled", text="⏳  취소 중...")
+        except Exception:
+            pass
+        logger.warning("[사용자] 취소 요청을 받았습니다. 진행 중인 파일까지 마무리됩니다.")
+
+    # ================= 실행 로직 =================
+    def start_process(self):
+        master_blk = self.entry_block_name.get().strip()
+        slave_blk = master_blk
+
+        if not master_blk: messagebox.showwarning("입력 오류", "공통 도곽 블록 이름을 입력하세요."); return
+        if not self.list_path: messagebox.showwarning("입력 오류", "도면목록표 파일을 선택하세요."); return
+        if not self.dwg_folders: messagebox.showwarning("입력 오류", "분석할 개별 도면 폴더를 하나 이상 추가하세요."); return
+
+        # [스마트 분기] 체크박스가 켜져 있다면, slave(개별도면) 블록 이름을 별도로 챙김
+        if self.check_diff_name.get():
+            slave_blk = self.entry_slave_block.get().strip()
+            if not slave_blk: messagebox.showwarning("입력 오류", "개별도면용 도곽 이름을 입력하세요."); return
+
+        # 취소 이벤트 초기화
+        self.cancel_event.clear()
+
+        # 버튼 전환: 시작 → 취소
+        self.btn_start.pack_forget()
+        self.btn_cancel.configure(state="normal", text="⏹  취소")
+        self.btn_cancel.pack(fill="x")
+
+        # 진행률 막대 + 라벨 표시 (결정형)
+        self.progressbar.set(0)
+        self.progressbar.pack(fill="x", padx=16, pady=(6, 0))
+        self.lbl_progress.configure(text="준비 중...")
+        self.lbl_progress.pack(padx=16, pady=(2, 0))
+
+        thread = threading.Thread(target=self.run_core_logic, args=(master_blk, slave_blk), daemon=True)
+        thread.start()
+
+    def run_core_logic(self, master_blk, slave_blk):
+        try:
+            # 1. 박스 좌표(ROI)는 무조건 Master 기준(도면목록표)으로 불러옵니다.
+            roi_config = load_roi_config(master_blk)
+            if not roi_config:
+                logger.error("[오류] '%s'에 대한 구역 설정(JSON) 파일이 없습니다!", master_blk)
+                logger.error("캐드에서 목록표 파일에 SET_ROI 명령어로 구역을 지정해 주세요.")
+                return
+
+            base_w = float(roi_config.get('base_w', 841.0))
+            base_h = float(roi_config.get('base_h', 594.0))
+            logger.info("[성공] '%s' 설정을 로드했습니다. (원본크기: %.0fx%.0f)", master_blk, base_w, base_h)
+
+            xref_texts = []
+            if self.xref_path and os.path.isfile(self.xref_path):
+                xref_texts = _parse_xref_original(self.xref_path)
+
+            logger.info("-" * 72)
+            실행폴더 = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+            최종_저장경로 = os.path.join(실행폴더, 리포트_이름)
+
+            # 2. 목록표 스캔 (Master 블록 이름 사용)
+            list_데이터 = extract_dwg_list_table(self.list_path, master_blk, roi_config, base_w, base_h, xref_texts)
+            if self.cancel_event.is_set():
+                logger.warning("[취소] 목록표 분석 직후 사용자 취소. 리포트 생성을 건너뜁니다.")
+                return
+
+            # 3. 개별도면 스캔 (Slave 블록 이름 사용 - 같으면 Master 이름)
+            if master_blk != slave_blk: logger.info("💡 [스마트 탐색 모드] 개별도면은 '%s' 도곽 이름으로 탐색을 시작합니다.", slave_blk)
+            dwg_데이터, 뷰심볼_데이터 = extract_dwg_data_multiprocess(
+                self.dwg_folders, slave_blk, roi_config, base_w, base_h, xref_texts,
+                progress_cb=self._on_progress, cancel_event=self.cancel_event)
+
+            # 4. 리포트 생성
+            build_report(list_데이터, dwg_데이터, 최종_저장경로, view_df=뷰심볼_데이터)
+
+            logger.info("-" * 72)
+            if self.cancel_event.is_set():
+                logger.warning("[DONE] 사용자 취소 — 일부 데이터만 반영된 리포트가 저장되었습니다.")
+            else:
+                logger.info("[DONE] 검토 완료! 리포트가 프로그램과 같은 폴더에 저장되었습니다.")
+            os.startfile(실행폴더)
+
+        except PermissionError: logger.error("[ERROR] 엑셀 파일이 이미 켜져 있습니다. 창을 닫고 다시 실행해 주세요.")
+        except Exception as e: logger.error("[ERROR] 시스템 오류 발생: %s", e)
+        finally:
+            def _finish():
+                # 버튼 전환: 취소 → 시작
+                self.btn_cancel.pack_forget()
+                self.btn_cancel.configure(state="normal", text="⏹  취소")
+                self.btn_start.configure(state="normal", text="검토 시작  →")
+                self.btn_start.pack(fill="x")
+                # 진행률 막대 정리
+                self.progressbar.set(0)
+                self.progressbar.pack_forget()
+                self.lbl_progress.configure(text="")
+                self.lbl_progress.pack_forget()
+            self.after(0, _finish)
+
+# ============================================================================
+# 메인 실행
+# ============================================================================
+def _ensure_oda_installed() -> bool:
+    """ODA 미설치 시 다운로드 → 사용자 설치 → 재검색 루프. 성공하면 True, 사용자가 취소하면 False."""
+    while not _oda_환경_설정():
+        root = tk.Tk(); root.withdraw()
+        retry = messagebox.askretrycancel(
+            "엔진 설치 안내",
+            "⚠️ CAD 분석 엔진(ODA File Converter)이 설치되어 있지 않습니다.\n\n"
+            "[다시 시도] → 다운로드 페이지를 열고, 설치 후 확인 시 자동 재검색\n"
+            "[취소] → 프로그램 종료"
+        )
+        if not retry:
+            root.destroy()
+            return False
+        webbrowser.open(ODA_DOWNLOAD_URL)
+        proceed = messagebox.askokcancel(
+            "설치 완료 확인",
+            "ODA File Converter 설치가 끝나면 [확인]을 눌러주세요.\n"
+            "기본 경로(C:\\Program Files\\ODA)에 설치되었어야 합니다.\n\n"
+            "[취소] → 프로그램 종료"
+        )
+        root.destroy()
+        if not proceed:
+            return False
+    return True
+
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    if not _ensure_oda_installed():
+        sys.exit()
+
+    app = AutoDWGApp()
+    app.mainloop()
