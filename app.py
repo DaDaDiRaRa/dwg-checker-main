@@ -5,7 +5,7 @@ Copyright (c) 2026 건원건축 김정현. All rights reserved.
 외부 업체로의 유출, 무단 복제 및 소스코드 수정을 엄격히 금지합니다.
 
 
-app.py  —  DWG 자동 검토기 v_1.7 Ultimate Edition (Kunwon Masterpiece)
+app.py  —  DWG 자동 검토기 v6.8 (Kunwon Masterpiece)
 ========================================================================
 [V6.7 업데이트]
 1. Drag & Drop 완벽 지원: 윈도우 탐색기에서 파일(.dwg)이나 폴더를 마우스로 끌어서
@@ -898,6 +898,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
     파일명, 데이터, 뷰심볼, 에러메시지 = os.path.basename(전체경로), [], [], ""
     view_roi = roi_cfg.get('view_symbol_roi')
     seen_circles: set = set()  # 파일 전체 기준 원 중복 방지
+    doc = None
     try:
         doc = _cad_로드(Path(전체경로)); 도곽_발견됨 = False
         for layout in doc.layouts:
@@ -956,7 +957,7 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                     번호 = _도면번호_세척(fallback_match); raw_matched_str = fallback_match
                 
                 명칭 = t_str_clean
-                if raw_matched_str and raw_matched_str in 명칭: 명칭 = 명칭.replace(raw_matched_str, "")
+                if raw_matched_str and raw_matched_str in 명칭: 명칭 = 명칭.replace(raw_matched_str, "", 1)
                 dwg_dong = _extract_dong_from_title(명칭)
                 dwg_group = _extract_group_from_title(명칭) if not dwg_dong else ""
                 dwg_group_info = dwg_dong or dwg_group
@@ -980,10 +981,12 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                             sym.pop('_cx'); sym.pop('_cy')
                             sym.update({"파일명": 파일명, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
                             뷰심볼.append(sym)
-        del doc
         if not 도곽_발견됨: return 데이터, 뷰심볼, "도곽 블록 없음"
     except Exception as e:
         에러메시지 = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+    finally:
+        if doc is not None:
+            del doc
     return 데이터, 뷰심볼, 에러메시지
 
 def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str, roi_cfg: dict, base_w: float, base_h: float, xref_texts: List[Tuple[float, float, str, float]], progress_cb=None, cancel_event: Optional[threading.Event] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:

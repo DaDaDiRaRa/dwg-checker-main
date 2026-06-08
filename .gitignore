@@ -21,7 +21,10 @@ build/
 dist/
 *.spec
 
-# eeee
+# 개인 설정 / 로컬 경로 포함 파일
+cfg_list.txt
+xcfg.txt
+
 venv/
 __pycache__/
 *.pdf
