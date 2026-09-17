@@ -18,13 +18,14 @@ app.py  —  DWG 자동 검토기 v6.8 (Kunwon Masterpiece)
 """
 
 from __future__ import annotations
-import glob, os, re, sys, webbrowser, json, math, logging, traceback
+import glob, os, re, sys, webbrowser, json, math, logging, traceback, shutil, multiprocessing
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
 import concurrent.futures
 from pathlib import Path
 from typing import List, Optional, Tuple
+from datetime import datetime
 
 import pandas as pd
 import ezdxf
@@ -54,7 +55,24 @@ def _setup_file_logger():
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-8s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(fh)
 
-_setup_file_logger()
+if multiprocessing.current_process().name == 'MainProcess':
+    _setup_file_logger()
+
+def _extract_lsp_to_exe_folder():
+    """EXE 번들에 포함된 SET_ROI.lsp를 EXE 실행 폴더에 추출합니다. (최초 실행 시 1회)"""
+    if not getattr(sys, 'frozen', False):
+        return
+    bundle_lsp = os.path.join(sys._MEIPASS, 'SET_ROI.lsp')
+    if not os.path.isfile(bundle_lsp):
+        return
+    exe_dir = os.path.dirname(sys.executable)
+    dest = os.path.join(exe_dir, 'SET_ROI.lsp')
+    if not os.path.isfile(dest):
+        try:
+            shutil.copy2(bundle_lsp, dest)
+            logger.info("[INFO] SET_ROI.lsp → %s", dest)
+        except Exception:
+            logger.warning("[경고] SET_ROI.lsp 자동 추출 실패")
 
 리포트_이름: str = "도면검토리포트_최종.xlsx"
 ODA_DOWNLOAD_URL = "https://www.opendesign.com/guestfiles/oda_file_converter"
@@ -291,6 +309,12 @@ def _expand_title_keywords(title: str) -> set:
         result.add(last)
     return {w for w in result if w}
 
+def _normalize_name_for_compare(s: str) -> str:
+    """도면명 비교용 정규화: 슬래시를 쉼표로 통일 후 축약형 전개, 정렬된 문자열 반환.
+    예) '입,단면도' == '입면도/단면도', '관리사무소 / 경로당' == '관리사무소/경로당'"""
+    s = re.sub(r'\s*/\s*', ',', str(s).strip())
+    return ",".join(sorted(_expand_title_keywords(s)))
+
 def _title_contains_view(block_title: str, view_title: str) -> bool:
     """뷰 심볼 도면명의 단어들이 도곽 도면명 안에 모두 포함되는지 확인.
     뷰 도면명 끝의 번호 접미사(예: '-1', '-2')는 비교 전에 제거한다."""
@@ -309,7 +333,17 @@ def _cad_로드(path: Path):
     if path.suffix.lower() == ".dxf": return ezdxf.readfile(str(path))
     _oda_환경_설정()
     from ezdxf.addons import odafc
-    return odafc.readfile(str(path))
+    path_str = str(path)
+    # ODA File Converter가 비ASCII 경로(한글 폴더명 등)를 처리하지 못하는 경우 → ASCII 임시 경로로 복사
+    if not path_str.isascii():
+        import tempfile
+        tmp_base = r"C:\ProgramData\AutoDWGChecker\tmp"
+        os.makedirs(tmp_base, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="odatmp_", dir=tmp_base) as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "src" + path.suffix.lower())
+            shutil.copy2(path_str, tmp_path)
+            return odafc.readfile(tmp_path)
+    return odafc.readfile(path_str)
 
 def _find_도곽_blocks(layout, target_block: str) -> list:
     """도곽 INSERT 검색. 정확 일치(공백/대소문자 무시) 우선, 없으면 부분일치 fallback."""
@@ -887,11 +921,12 @@ def extract_dwg_list_table(dwg_path: str, block_name: str, roi_cfg: dict, base_w
     if df.empty:
         logger.warning("[경고] 도면목록표 추출 결과가 0건입니다. ROI(단 박스) 범위를 다시 확인해 주세요.")
         return pd.DataFrame(columns=["도면번호(LIST)", "구분_LIST(그룹)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)"])
-    before = len(df)
-    df = df.drop_duplicates(subset=["도면번호(LIST)"]).reset_index(drop=True)
-    if before != len(df):
-        logger.warning("[경고] 도면목록표에 도면번호 중복 행 %d개 발견 → 첫 행만 채택했습니다.", before - len(df))
-    return df
+    dup_mask = df.duplicated(subset=["도면번호(LIST)"], keep='first')
+    df_dup = df[dup_mask].reset_index(drop=True)
+    df = df[~dup_mask].reset_index(drop=True)
+    if not df_dup.empty:
+        logger.warning("[경고] 도면목록표에 도면번호 중복 행 %d개 발견 → 첫 행만 채택, 중복 행은 리포트 하단에 별도 표시됩니다.", len(df_dup))
+    return df, df_dup
 
 def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[float, float, str, float]]]) -> Tuple[List[dict], List[dict], str]:
     전체경로, 목표블록, roi_cfg, base_w, base_h, xref_texts = args
@@ -958,17 +993,11 @@ def _process_single_dwg(args: Tuple[str, str, dict, float, float, List[Tuple[flo
                 
                 명칭 = t_str_clean
                 if raw_matched_str and raw_matched_str in 명칭: 명칭 = 명칭.replace(raw_matched_str, "", 1)
-                dwg_dong = _extract_dong_from_title(명칭)
-                dwg_group = _extract_group_from_title(명칭) if not dwg_dong else ""
-                dwg_group_info = dwg_dong or dwg_group
-                if dwg_dong:
-                    명칭 = re.sub(r"^" + re.escape(dwg_dong) + r"\s*", "", 명칭).strip()
-                if dwg_group:
-                    명칭 = re.sub(r"^" + re.escape(dwg_group) + r"\s*", "", 명칭).strip()
-
+                # DWG는 파일 하나씩 개별 처리라 동/그룹 추출 컨텍스트가 없어 오인식이 많음
+                # → 제목 원문 그대로 사용하고 LIST 측과 통째로 비교
                 명칭 = _clean_title_only(명칭); a1, a3 = _extract_scale_smart(s_texts, is_list_table=False)
                 if 번호:
-                    데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "구분_DWG(그룹)": dwg_group_info, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
+                    데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "도면명(DWG)": 명칭.strip(), "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
                     # 도곽마다 해당 위치 기준의 ROI에서 뷰 심볼 추출
                     # seen_circles로 ROI 중복 시 같은 원이 두 번 들어가는 것을 방지
                     if view_roi:
@@ -1008,7 +1037,7 @@ def extract_dwg_data_multiprocess(target_dirs: List[str], slave_block_name: str,
 
     최종_데이터, 최종_뷰심볼 = [], []
     취소됨 = False
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 4)) as executor:
         futures = {executor.submit(_process_single_dwg, (path, slave_block_name.strip().lower(), roi_cfg, base_w, base_h, xref_texts)): path for path in 캐드파일들}
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             if cancel_event is not None and cancel_event.is_set():
@@ -1111,26 +1140,18 @@ def _build_view_sheet(ws, view_df: pd.DataFrame):
             for j in range(1, len(col_keys) + 1):
                 ws.cell(i, j).fill = 빨간색
 
-def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, view_df: Optional[pd.DataFrame] = None):
+def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, view_df: Optional[pd.DataFrame] = None, dup_df: Optional[pd.DataFrame] = None):
     if list_df.empty and dwg_df.empty: logger.warning("[알림] 추출된 데이터가 없어 엑셀 리포트를 생성하지 않습니다."); return
 
     lst, dwg = list_df.copy(), dwg_df.copy()
     if "도면번호(LIST)" not in lst.columns: lst["도면번호(LIST)"] = ""
     if "도면번호(DWG)" not in dwg.columns: dwg["도면번호(DWG)"] = ""
     if "구분_LIST(그룹)" not in lst.columns: lst["구분_LIST(그룹)"] = ""
-    if "구분_DWG(그룹)" not in dwg.columns: dwg["구분_DWG(그룹)"] = ""
 
     lst["KEY"] = lst["도면번호(LIST)"].astype(str).str.upper().str.replace(r"[\s\-_]", "", regex=True)
     dwg["KEY"] = dwg["도면번호(DWG)"].astype(str).str.upper().str.replace(r"[\s\-_]", "", regex=True)
     결과 = pd.merge(lst, dwg, on="KEY", how="outer", indicator=True)
     결과["상태"] = 결과["_merge"].map({"both": "일치", "left_only": "DWG 누락", "right_only": "목록표 누락"})
-
-    group_mismatch_indices = set()
-    for i in range(len(결과)):
-        l_g = str(결과.at[i, "구분_LIST(그룹)"]).strip(); d_g = str(결과.at[i, "구분_DWG(그룹)"]).strip()
-        if l_g == "nan": l_g = ""
-        if d_g == "nan": d_g = ""
-        if l_g and d_g and l_g != d_g: group_mismatch_indices.add(i + 2)
 
     prev_group = ""; group_col_idx = 결과.columns.get_loc("구분_LIST(그룹)")
     for i in range(len(결과)):
@@ -1139,15 +1160,8 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, vie
         if curr_group == prev_group: 결과.iat[i, group_col_idx] = ""
         else: prev_group = curr_group
 
-    prev_dwg_group = ""; dwg_group_col_idx = 결과.columns.get_loc("구분_DWG(그룹)")
-    for i in range(len(결과)):
-        curr_group = str(결과.iat[i, dwg_group_col_idx]).strip()
-        if curr_group == "nan" or not curr_group: prev_dwg_group = ""; 결과.iat[i, dwg_group_col_idx] = ""; continue
-        if curr_group == prev_dwg_group: 결과.iat[i, dwg_group_col_idx] = ""
-        else: prev_dwg_group = curr_group
-
     cols = ["도면번호(LIST)", "구분_LIST(그룹)", "도면명(LIST)", "축척_A1(LIST)", "축척_A3(LIST)",
-            "도면번호(DWG)", "구분_DWG(그룹)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "파일명", "상태"]
+            "도면번호(DWG)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "파일명", "상태"]
     for c in cols: 
         if c not in 결과.columns: 결과[c] = ""
     
@@ -1164,18 +1178,14 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, vie
             continue
 
         issues = []
-        if row in group_mismatch_indices:
-            issues.append("그룹")
-            if h.get("구분_LIST(그룹)"): ws.cell(row, h["구분_LIST(그룹)"]).fill = 빨간색
-            if h.get("구분_DWG(그룹)"): ws.cell(row, h["구분_DWG(그룹)"]).fill = 빨간색
         val_list = re.sub(r"[\s\-_]", "", str(ws.cell(row, h["도면번호(LIST)"]).value).upper())
         val_dwg  = re.sub(r"[\s\-_]", "", str(ws.cell(row, h["도면번호(DWG)"]).value).upper())
         if val_list != val_dwg:
             issues.append("도면번호")
             ws.cell(row, h["도면번호(LIST)"]).fill = 빨간색
             ws.cell(row, h["도면번호(DWG)"]).fill  = 빨간색
-        name_list = str(ws.cell(row, h["도면명(LIST)"]).value).replace(" ", "")
-        name_dwg  = str(ws.cell(row, h["도면명(DWG)"]).value).replace(" ", "")
+        name_list = _normalize_name_for_compare(ws.cell(row, h["도면명(LIST)"]).value)
+        name_dwg  = _normalize_name_for_compare(ws.cell(row, h["도면명(DWG)"]).value)
         if name_list != name_dwg:
             issues.append("도면명")
             ws.cell(row, h["도면명(LIST)"]).fill = 빨간색
@@ -1193,6 +1203,27 @@ def build_report(list_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str, vie
         if issues:
             ws.cell(row, h["상태"]).value = "/".join(issues) + " 불일치"
             ws.cell(row, h["상태"]).fill  = 빨간색
+
+    # 중복 도면번호 행을 시트 하단에 주황색으로 추가
+    if dup_df is not None and not dup_df.empty:
+        주황색 = PatternFill(start_color="FFFFD699", end_color="FFFFD699", fill_type="solid")
+        next_row = ws.max_row + 2  # 빈 줄 하나 띄우고 시작
+        ws.cell(next_row - 1, 1, "▼ 목록표 중복 도면번호 (아래 행은 첫 번째 이후의 중복 행입니다)").fill = 주황색
+        for _, r in dup_df.iterrows():
+            vals = {
+                "도면번호(LIST)": r.get("도면번호(LIST)", ""),
+                "구분_LIST(그룹)": r.get("구분_LIST(그룹)", ""),
+                "도면명(LIST)": r.get("도면명(LIST)", ""),
+                "축척_A1(LIST)": r.get("축척_A1(LIST)", ""),
+                "축척_A3(LIST)": r.get("축척_A3(LIST)", ""),
+                "상태": "목록표 중복 도면번호",
+            }
+            for col_name, val in vals.items():
+                if col_name in h:
+                    c = ws.cell(next_row, h[col_name], str(val) if val else "")
+                    c.fill = 주황색
+            next_row += 1
+        logger.warning("[경고] 목록표 중복 도면번호 %d행이 리포트 하단에 주황색으로 표시되었습니다.", len(dup_df))
 
     if view_df is not None and not view_df.empty:
         ws_view = wb.create_sheet("뷰심볼 검토")
@@ -1509,6 +1540,7 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
         thread.start()
 
     def run_core_logic(self, master_blk, slave_blk):
+        최종_저장경로 = None
         try:
             # 1. 박스 좌표(ROI)는 무조건 Master 기준(도면목록표)으로 불러옵니다.
             roi_config = load_roi_config(master_blk)
@@ -1527,10 +1559,10 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
             logger.info("-" * 72)
             실행폴더 = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-            최종_저장경로 = os.path.join(실행폴더, 리포트_이름)
+            최종_저장경로 = os.path.join(실행폴더, f"도면검토리포트_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
 
             # 2. 목록표 스캔 (Master 블록 이름 사용)
-            list_데이터 = extract_dwg_list_table(self.list_path, master_blk, roi_config, base_w, base_h, xref_texts)
+            list_데이터, dup_데이터 = extract_dwg_list_table(self.list_path, master_blk, roi_config, base_w, base_h, xref_texts)
             if self.cancel_event.is_set():
                 logger.warning("[취소] 목록표 분석 직후 사용자 취소. 리포트 생성을 건너뜁니다.")
                 return
@@ -1542,7 +1574,7 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 progress_cb=self._on_progress, cancel_event=self.cancel_event)
 
             # 4. 리포트 생성
-            build_report(list_데이터, dwg_데이터, 최종_저장경로, view_df=뷰심볼_데이터)
+            build_report(list_데이터, dwg_데이터, 최종_저장경로, view_df=뷰심볼_데이터, dup_df=dup_데이터)
 
             logger.info("-" * 72)
             if self.cancel_event.is_set():
@@ -1551,7 +1583,11 @@ class AutoDWGApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 logger.info("[DONE] 검토 완료! 리포트가 프로그램과 같은 폴더에 저장되었습니다.")
             os.startfile(실행폴더)
 
-        except PermissionError: logger.error("[ERROR] 엑셀 파일이 이미 켜져 있습니다. 창을 닫고 다시 실행해 주세요.")
+        except PermissionError:
+            if 최종_저장경로 and os.path.isfile(최종_저장경로):
+                logger.error("[ERROR] 엑셀 파일이 이미 켜져 있습니다. 파일을 닫고 다시 실행해 주세요.")
+            else:
+                logger.error("[ERROR] 리포트 저장 실패: 해당 폴더에 쓰기 권한이 없습니다. 실행 파일을 다른 폴더로 이동해 주세요.")
         except Exception as e: logger.error("[ERROR] 시스템 오류 발생: %s", e)
         finally:
             def _finish():
@@ -1596,11 +1632,33 @@ def _ensure_oda_installed() -> bool:
     return True
 
 if __name__ == "__main__":
-    import multiprocessing
     multiprocessing.freeze_support()
 
-    if not _ensure_oda_installed():
+    # 중복 실행 방지 (Windows 명명된 뮤텍스)
+    import ctypes
+    _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "AutoDWGChecker_SingleInstance_v68")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        _r = tk.Tk(); _r.withdraw()
+        messagebox.showwarning("AutoDWG", "이미 실행 중입니다.\n열려 있는 창을 확인해 주세요.", parent=_r)
+        _r.destroy()
         sys.exit()
 
-    app = AutoDWGApp()
-    app.mainloop()
+    try:
+        _extract_lsp_to_exe_folder()
+        if not _ensure_oda_installed():
+            sys.exit()
+        app = AutoDWGApp()
+        app.mainloop()
+    except Exception:
+        log_path = os.path.join(os.environ.get("APPDATA", ""), "AutoDWG_Checker", "autodwg.log")
+        msg = (
+            "예기치 않은 오류로 프로그램이 종료되었습니다.\n\n"
+            f"로그 파일: {log_path}\n\n"
+            f"{traceback.format_exc()}"
+        )
+        try:
+            _r = tk.Tk(); _r.withdraw()
+            messagebox.showerror("AutoDWG 시작 오류", msg, parent=_r)
+            _r.destroy()
+        except Exception:
+            pass
